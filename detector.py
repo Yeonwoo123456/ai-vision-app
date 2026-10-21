@@ -1,4 +1,11 @@
+import cv2
 
+print("OpenCV version:", getattr(cv2, "__version__", "unknown"))
+print("OpenCV path:", getattr(cv2, "__file__", "unknown"))
+print(
+    "CascadeClassifier available:",
+    hasattr(cv2, "CascadeClassifier")
+)
 import cv2
 import numpy as np
 
