@@ -1,10 +1,13 @@
 import base64
 import io
+import os
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 from PIL import Image, ImageOps
+from sqlalchemy import create_engine, text
 from detector import detect_faces
 
 
@@ -13,6 +16,77 @@ st.set_page_config(
     layout="wide",
 )
 
+
+
+def get_database_url():
+    """Read the Neon connection string from Streamlit Secrets or environment."""
+    try:
+        url = st.secrets.get("DATABASE_URL", "")
+    except Exception:
+        url = ""
+
+    if not url:
+        url = os.environ.get("DATABASE_URL", "")
+
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+psycopg://", 1)
+    elif url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+psycopg://", 1)
+
+    return url
+
+
+@st.cache_resource
+def get_engine():
+    url = get_database_url()
+    if not url:
+        return None
+    return create_engine(url, pool_pre_ping=True, pool_recycle=300)
+
+
+def initialize_database(engine):
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE IF NOT EXISTS analysis_history (
+                id BIGSERIAL PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                face_count INTEGER NOT NULL,
+                image_width INTEGER NOT NULL,
+                image_height INTEGER NOT NULL,
+                face_index INTEGER NOT NULL,
+                landmark_count INTEGER NOT NULL,
+                eye_distance DOUBLE PRECISION,
+                face_width DOUBLE PRECISION,
+                face_height DOUBLE PRECISION,
+                width_height_ratio DOUBLE PRECISION,
+                mouth_gap DOUBLE PRECISION
+            )
+        """))
+
+
+def save_analysis(engine, face_count, width, height, result):
+    created_at = datetime.now(timezone.utc).isoformat()
+    with engine.begin() as connection:
+        connection.execute(
+            text("""
+                INSERT INTO analysis_history (
+                    created_at, face_count, image_width, image_height,
+                    face_index, landmark_count, eye_distance, face_width,
+                    face_height, width_height_ratio, mouth_gap
+                ) VALUES (
+                    :created_at, :face_count, :image_width, :image_height,
+                    :face_index, :landmark_count, :eye_distance, :face_width,
+                    :face_height, :width_height_ratio, :mouth_gap
+                )
+            """),
+            {
+                "created_at": created_at,
+                "face_count": face_count,
+                "image_width": width,
+                "image_height": height,
+                **result,
+            },
+        )
 
 def load_image(uploaded_file):
     data = uploaded_file.getvalue()
@@ -163,6 +237,22 @@ uploaded_file = (
     )
 )
 
+# Connect to the database for saving only; no history table or graph is displayed.
+db_engine = None
+db_error = None
+try:
+    db_engine = get_engine()
+    if db_engine is not None:
+        initialize_database(db_engine)
+except Exception as exc:
+    db_error = str(exc)
+    db_engine = None
+
+if db_engine is None:
+    st.caption("Database saving is unavailable until DATABASE_URL is configured correctly.")
+    if db_error:
+        st.warning(f"Database connection failed: {db_error}")
+
 if uploaded_file is not None:
     try:
         original = load_image(uploaded_file)
@@ -259,6 +349,28 @@ if uploaded_file is not None:
 
         st.subheader("Face Summary")
         st.dataframe(summary, use_container_width=True, hide_index=True)
+
+        # Always display the Save button. If the database is unavailable,
+        # show a clear message after the user clicks it instead of hiding it.
+        if st.button("Save analysis to database", key="save_analysis_to_database"):
+            if db_engine is None:
+                st.error(
+                    "Cannot save because the database is not connected. "
+                    "Check DATABASE_URL in Streamlit Secrets and the connection error above."
+                )
+            else:
+                try:
+                    for result in analyses:
+                        save_analysis(
+                            db_engine,
+                            len(faces),
+                            original.shape[1],
+                            original.shape[0],
+                            result,
+                        )
+                    st.success("Analysis summary saved to database.")
+                except Exception as exc:
+                    st.error(f"Unable to save analysis: {exc}")
 
         st.download_button(
             "Download analysis CSV",
