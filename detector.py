@@ -1,57 +1,107 @@
-import cv2
 
-print("OpenCV version:", getattr(cv2, "__version__", "unknown"))
-print("OpenCV path:", getattr(cv2, "__file__", "unknown"))
-print(
-    "CascadeClassifier available:",
-    hasattr(cv2, "CascadeClassifier")
-)
+from pathlib import Path
+import urllib.request
+
 import cv2
 import numpy as np
+import mediapipe as mp
+
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+
+
+MODEL_PATH = Path(__file__).parent / "face_landmarker.task"
+
+MODEL_URL = (
+    "https://storage.googleapis.com/"
+    "mediapipe-models/face_landmarker/"
+    "face_landmarker/float16/1/"
+    "face_landmarker.task"
+)
+
+
+def ensure_model():
+    """MediaPipe 모델 파일이 없으면 다운로드한다."""
+    if not MODEL_PATH.exists():
+        urllib.request.urlretrieve(MODEL_URL, str(MODEL_PATH))
+
+    if MODEL_PATH.stat().st_size == 0:
+        raise RuntimeError("Face Landmarker 모델 파일이 비어 있습니다.")
 
 
 def detect_faces(image_rgb):
     """
-    RGB 이미지에서 얼굴 영역을 검출한다.
-    반환값: (검출 결과 이미지, 얼굴 영역 좌표 목록)
+    RGB 이미지에서 얼굴 랜드마크를 검출한다.
+
+    반환:
+        annotated_rgb: 랜드마크가 그려진 RGB 이미지
+        face_data: 얼굴별 랜드마크 좌표 목록
     """
     if image_rgb is None or image_rgb.size == 0:
         raise ValueError("유효한 이미지를 입력해야 합니다.")
 
-    gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
+    if image_rgb.ndim != 3 or image_rgb.shape[2] != 3:
+        raise ValueError("RGB 3채널 이미지를 입력해야 합니다.")
 
-    cascade_path = (
-        cv2.data.haarcascades
-        + "haarcascade_frontalface_default.xml"
-    )
-    face_cascade = cv2.CascadeClassifier(cascade_path)
+    ensure_model()
 
-    if face_cascade.empty():
-        raise RuntimeError("얼굴 검출 모델을 불러오지 못했습니다.")
-
-    faces = face_cascade.detectMultiScale(
-        gray,
-        scaleFactor=1.1,
-        minNeighbors=5,
-        minSize=(40, 40)
+    options = vision.FaceLandmarkerOptions(
+        base_options=python.BaseOptions(
+            model_asset_path=str(MODEL_PATH)
+        ),
+        running_mode=vision.RunningMode.IMAGE,
+        num_faces=5,
+        output_face_blendshapes=True
     )
 
-    result = image_rgb.copy()
-    face_boxes = []
+    mp_image = mp.Image(
+        image_format=mp.ImageFormat.SRGB,
+        data=np.ascontiguousarray(image_rgb)
+    )
 
-    for (x, y, w, h) in faces:
-        cv2.rectangle(
-            result,
-            (x, y),
-            (x + w, y + h),
-            (0, 255, 0),
-            2
-        )
-        face_boxes.append({
-            "x": int(x),
-            "y": int(y),
-            "width": int(w),
-            "height": int(h)
+    with vision.FaceLandmarker.create_from_options(options) as landmarker:
+        result = landmarker.detect(mp_image)
+
+    annotated_rgb = image_rgb.copy()
+    height, width = annotated_rgb.shape[:2]
+    face_data = []
+
+    connections = vision.FaceLandmarksConnections.FACE_LANDMARKS_TESSELATION
+
+    for face_index, landmarks in enumerate(result.face_landmarks):
+        points = []
+
+        for landmark in landmarks:
+            x = int(landmark.x * width)
+            y = int(landmark.y * height)
+            points.append((x, y))
+
+        # 얼굴 메시를 촘촘한 선으로 표시
+        for connection in connections:
+            start = connection.start
+            end = connection.end
+
+            if start < len(points) and end < len(points):
+                cv2.line(
+                    annotated_rgb,
+                    points[start],
+                    points[end],
+                    (0, 255, 0),
+                    1,
+                    cv2.LINE_AA
+                )
+
+        face_data.append({
+            "face_index": face_index,
+            "landmark_count": len(landmarks),
+            "landmarks": [
+                {
+                    "x": round(float(point.x), 6),
+                    "y": round(float(point.y), 6),
+                    "z": round(float(point.z), 6)
+                }
+                for point in landmarks
+            ]
         })
 
-    return result, face_boxes
+    return annotated_rgb, face_data
