@@ -1,11 +1,14 @@
 
 import base64
 import io
+import os
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 from PIL import Image, ImageOps
+from sqlalchemy import create_engine, text
 from detector import detect_faces
 
 
@@ -15,42 +18,82 @@ st.set_page_config(
 )
 
 
+def get_database_url():
+    try:
+        url = st.secrets.get("DATABASE_URL", "")
+    except Exception:
+        url = ""
+
+    if not url:
+        url = os.environ.get("DATABASE_URL", "")
+
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+psycopg://", 1)
+    elif url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+psycopg://", 1)
+
+    return url
+
+
+@st.cache_resource
+def get_engine():
+    url = get_database_url()
+
+    if not url:
+        return None
+
+    return create_engine(
+        url,
+        pool_pre_ping=True,
+        pool_recycle=300,
+    )
+
+
+def initialize_database(engine):
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE IF NOT EXISTS analysis_history (
+                id BIGSERIAL PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                face_count INTEGER NOT NULL,
+                image_width INTEGER NOT NULL,
+                image_height INTEGER NOT NULL,
+                face_index INTEGER NOT NULL,
+                landmark_count INTEGER NOT NULL,
+                eye_distance DOUBLE PRECISION,
+                face_width DOUBLE PRECISION,
+                face_height DOUBLE PRECISION,
+                width_height_ratio DOUBLE PRECISION,
+                mouth_gap DOUBLE PRECISION
+            )
+        """))
+
+
 def load_image(uploaded_file):
-    image_bytes = uploaded_file.getvalue()
+    data = uploaded_file.getvalue()
 
-    if not image_bytes:
-        raise ValueError("The uploaded file is empty.")
+    if not data:
+        raise ValueError("The uploaded image is empty.")
 
-    with Image.open(io.BytesIO(image_bytes)) as image:
-        image = ImageOps.exif_transpose(image)
-        image = image.convert("RGB")
+    with Image.open(io.BytesIO(data)) as image:
+        image = ImageOps.exif_transpose(image).convert("RGB")
         image.load()
-        result = np.array(image, dtype=np.uint8)
-
-    if result.ndim != 3 or result.shape[2] != 3:
-        raise ValueError("The image must have three RGB channels.")
-
-    if result.size == 0:
-        raise ValueError("The image contains no pixel data.")
+        result = np.asarray(image, dtype=np.uint8)
 
     return np.ascontiguousarray(result)
 
 
 def validate_image(image):
-    if image is None:
-        raise ValueError("No image is available.")
-
     image = np.asarray(image)
 
     if image.ndim != 3 or image.shape[2] != 3:
-        raise ValueError("The image must have three RGB channels.")
+        raise ValueError("Expected an RGB image.")
 
     if image.shape[0] == 0 or image.shape[1] == 0:
-        raise ValueError("The image dimensions are invalid.")
+        raise ValueError("Invalid image dimensions.")
 
     if image.dtype != np.uint8:
-        image = np.nan_to_num(image)
-        image = np.clip(image, 0, 255).astype(np.uint8)
+        image = np.clip(np.nan_to_num(image), 0, 255).astype(np.uint8)
 
     return np.ascontiguousarray(image)
 
@@ -60,117 +103,73 @@ def show_image(image, caption):
 
     buffer = io.BytesIO()
     Image.fromarray(image).save(buffer, format="PNG")
-
-    encoded = base64.b64encode(
-        buffer.getvalue()
-    ).decode("ascii")
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
 
     st.markdown(f"**{caption}**")
 
     st.html(
         f"""
-        <div style="width:100%; overflow:hidden;">
-            <img
-                src="data:image/png;base64,{encoded}"
-                alt="Image preview"
-                style="
-                    display:block;
-                    width:100%;
-                    height:auto;
-                    object-fit:contain;
-                "
-            />
+        <div style="width:100%;overflow:hidden;">
+          <img
+            src="data:image/png;base64,{encoded}"
+            alt="Image preview"
+            style="display:block;width:100%;height:auto;object-fit:contain;"
+          />
         </div>
         """
     )
 
 
-def point_distance(p1, p2):
-    return float(
-        np.sqrt(
-            (p1["x"] - p2["x"]) ** 2
-            + (p1["y"] - p2["y"]) ** 2
-        )
-    )
+def distance(p1, p2):
+    return float(np.hypot(p1["x"] - p2["x"], p1["y"] - p2["y"]))
 
 
-def center_of_points(landmarks, indices):
-    points = [
-        landmarks[index]
-        for index in indices
-        if index < len(landmarks)
-    ]
+def center(landmarks, indices):
+    points = [landmarks[i] for i in indices if i < len(landmarks)]
 
     if not points:
         return None
 
     return {
-        "x": float(np.mean([point["x"] for point in points])),
-        "y": float(np.mean([point["y"] for point in points])),
-        "z": float(np.mean([point["z"] for point in points])),
+        "x": float(np.mean([p["x"] for p in points])),
+        "y": float(np.mean([p["y"] for p in points])),
+        "z": float(np.mean([p["z"] for p in points])),
     }
 
 
 def analyze_face(face):
-    landmarks = face["landmarks"]
+    points = face["landmarks"]
 
-    def get_point(index):
-        if index < len(landmarks):
-            return landmarks[index]
-        return None
+    def point(index):
+        return points[index] if index < len(points) else None
 
-    left_eye = center_of_points(
-        landmarks, [33, 133, 159, 145]
-    )
-    right_eye = center_of_points(
-        landmarks, [362, 263, 386, 374]
-    )
+    left_eye = center(points, [33, 133, 159, 145])
+    right_eye = center(points, [362, 263, 386, 374])
 
-    nose_tip = get_point(1)
-    upper_lip = get_point(13)
-    lower_lip = get_point(14)
-
-    face_left = get_point(234)
-    face_right = get_point(454)
-    face_top = get_point(10)
-    face_bottom = get_point(152)
+    left = point(234)
+    right = point(454)
+    top = point(10)
+    bottom = point(152)
+    upper_lip = point(13)
+    lower_lip = point(14)
 
     eye_distance = (
-        point_distance(left_eye, right_eye)
+        distance(left_eye, right_eye)
         if left_eye and right_eye else None
     )
-
-    face_width = (
-        point_distance(face_left, face_right)
-        if face_left and face_right else None
+    face_width = distance(left, right) if left and right else None
+    face_height = distance(top, bottom) if top and bottom else None
+    mouth_gap = (
+        distance(upper_lip, lower_lip)
+        if upper_lip and lower_lip else None
     )
 
-    face_height = (
-        point_distance(face_top, face_bottom)
-        if face_top and face_bottom else None
-    )
-
-    width_height_ratio = (
+    ratio = (
         face_width / face_height
         if face_width is not None
         and face_height is not None
         and face_height > 0
         else None
-    )
-
-    nose_offset = None
-
-    if left_eye and right_eye and nose_tip:
-        nose_offset = {
-            "x": nose_tip["x"]
-            - (left_eye["x"] + right_eye["x"]) / 2,
-            "y": nose_tip["y"]
-            - (left_eye["y"] + right_eye["y"]) / 2,
-        }
-
-    mouth_gap = (
-        point_distance(upper_lip, lower_lip)
-        if upper_lip and lower_lip else None
     )
 
     return {
@@ -179,25 +178,67 @@ def analyze_face(face):
         "eye_distance": eye_distance,
         "face_width": face_width,
         "face_height": face_height,
-        "width_height_ratio": width_height_ratio,
-        "nose_offset": nose_offset,
+        "width_height_ratio": ratio,
         "mouth_gap": mouth_gap,
     }
 
 
-def format_percent(value):
-    if value is None:
-        return "N/A"
-    return f"{value * 100:.2f}%"
+def pct(value):
+    return f"{value * 100:.2f}%" if value is not None else "N/A"
+
+
+def save_analysis(engine, face_count, width, height, result):
+    created_at = datetime.now(timezone.utc).isoformat()
+
+    with engine.begin() as connection:
+        connection.execute(
+            text("""
+                INSERT INTO analysis_history (
+                    created_at, face_count, image_width, image_height,
+                    face_index, landmark_count, eye_distance,
+                    face_width, face_height, width_height_ratio, mouth_gap
+                )
+                VALUES (
+                    :created_at, :face_count, :image_width, :image_height,
+                    :face_index, :landmark_count, :eye_distance,
+                    :face_width, :face_height, :width_height_ratio, :mouth_gap
+                )
+            """),
+            {
+                "created_at": created_at,
+                "face_count": face_count,
+                "image_width": width,
+                "image_height": height,
+                **result,
+            },
+        )
+
+
+def load_history(engine, limit=100):
+    with engine.connect() as connection:
+        result = connection.execute(
+            text("""
+                SELECT id, created_at, face_count, image_width,
+                       image_height, face_index, landmark_count,
+                       eye_distance, face_width, face_height,
+                       width_height_ratio, mouth_gap
+                FROM analysis_history
+                ORDER BY id DESC
+                LIMIT :limit
+            """),
+            {"limit": limit},
+        )
+
+        return pd.DataFrame(result.mappings().all())
 
 
 st.title("AI Vision Lab")
-st.caption("Facial Landmark Analysis and Dashboard")
+st.caption("Facial Landmark Analysis")
 
 with st.sidebar:
     st.header("Settings")
 
-    input_mode = st.radio(
+    source = st.radio(
         "Image source",
         ["Camera", "Upload image"],
     )
@@ -212,190 +253,205 @@ with st.sidebar:
         value=False,
     )
 
-if input_mode == "Camera":
-    uploaded_file = st.camera_input("Take a picture")
-else:
-    uploaded_file = st.file_uploader(
+    show_history = st.checkbox(
+        "Show saved analysis history",
+        value=True,
+    )
+
+uploaded_file = (
+    st.camera_input("Take a picture")
+    if source == "Camera"
+    else st.file_uploader(
         "Upload an image",
         type=["jpg", "jpeg", "png", "webp"],
     )
+)
 
-if uploaded_file is None:
-    st.info("Take a picture or upload an image to begin.")
-    st.stop()
+engine = None
+database_error = None
 
 try:
-    original_rgb = load_image(uploaded_file)
+    engine = get_engine()
+
+    if engine is not None:
+        initialize_database(engine)
 except Exception as exc:
-    st.error(f"Unable to load image: {exc}")
-    st.stop()
+    database_error = str(exc)
+    engine = None
 
-try:
-    with st.spinner("Analyzing image..."):
-        annotated_rgb, face_data = detect_faces(original_rgb)
+if engine is None:
+    st.warning(
+        "Persistent database is not connected. "
+        "Configure DATABASE_URL to enable saved history."
+    )
 
-    original_rgb = validate_image(original_rgb)
-    annotated_rgb = validate_image(annotated_rgb)
+    if database_error:
+        st.error(f"Database connection failed: {database_error}")
 
-    if annotated_rgb.shape != original_rgb.shape:
-        raise ValueError(
-            "The processed image dimensions do not match "
-            "the original image."
+if uploaded_file is not None:
+    try:
+        original = load_image(uploaded_file)
+
+        with st.spinner("Analyzing image..."):
+            annotated, faces = detect_faces(original)
+
+        original = validate_image(original)
+        annotated = validate_image(annotated)
+
+        if annotated.shape != original.shape:
+            raise ValueError("Image dimensions changed during processing.")
+
+    except Exception as exc:
+        st.error(f"Image processing failed: {exc}")
+        st.stop()
+
+    analyses = [analyze_face(face) for face in faces]
+
+    st.subheader("Analysis Overview")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Faces detected", len(faces))
+    c2.metric(
+        "Total landmarks",
+        sum(face["landmark_count"] for face in faces),
+    )
+    c3.metric("Width", f"{original.shape[1]} px")
+    c4.metric("Height", f"{original.shape[0]} px")
+
+    left_col, right_col = st.columns(2)
+
+    with left_col:
+        show_image(original, "Original image")
+
+    with right_col:
+        if show_landmarks:
+            show_image(annotated, "Landmark visualization")
+
+    if not faces:
+        st.warning("No face was detected.")
+    else:
+        st.subheader("Feature Measurements")
+
+        selected_index = st.selectbox(
+            "Select face",
+            range(len(faces)),
+            format_func=lambda i: f"Face {i + 1}",
         )
 
-except Exception as exc:
-    st.error(f"Image processing failed: {exc}")
-    st.stop()
+        selected = analyses[selected_index]
 
-analyses = [analyze_face(face) for face in face_data]
+        a, b, c, d = st.columns(4)
+        a.metric("Eye distance", pct(selected["eye_distance"]))
+        b.metric("Face width", pct(selected["face_width"]))
+        c.metric("Face height", pct(selected["face_height"]))
+        d.metric(
+            "Width / height",
+            f'{selected["width_height_ratio"]:.3f}'
+            if selected["width_height_ratio"] is not None
+            else "N/A",
+        )
 
-st.subheader("Analysis Overview")
+        e, f = st.columns(2)
+        e.metric("Mouth opening", pct(selected["mouth_gap"]))
+        f.metric("Landmarks", selected["landmark_count"])
 
-col1, col2, col3, col4 = st.columns(4)
+        rows = []
 
-col1.metric("Faces detected", len(face_data))
-col2.metric(
-    "Total landmarks",
-    sum(face["landmark_count"] for face in face_data),
-)
-col3.metric("Image width", f"{original_rgb.shape[1]} px")
-col4.metric("Image height", f"{original_rgb.shape[0]} px")
+        for result in analyses:
+            rows.append({
+                "Face": result["face_index"] + 1,
+                "Landmarks": result["landmark_count"],
+                "Eye distance (%)": (
+                    round(result["eye_distance"] * 100, 2)
+                    if result["eye_distance"] is not None else None
+                ),
+                "Face width (%)": (
+                    round(result["face_width"] * 100, 2)
+                    if result["face_width"] is not None else None
+                ),
+                "Face height (%)": (
+                    round(result["face_height"] * 100, 2)
+                    if result["face_height"] is not None else None
+                ),
+                "Width/height ratio": result["width_height_ratio"],
+                "Mouth opening (%)": (
+                    round(result["mouth_gap"] * 100, 2)
+                    if result["mouth_gap"] is not None else None
+                ),
+            })
 
-st.subheader("Visual Analysis")
+        summary = pd.DataFrame(rows)
 
-image_col1, image_col2 = st.columns(2)
+        st.subheader("Face Summary")
+        st.dataframe(summary, use_container_width=True, hide_index=True)
 
-with image_col1:
-    show_image(original_rgb, "Original Image")
+        if engine is not None:
+            if st.button("Save analysis to database"):
+                try:
+                    for result in analyses:
+                        save_analysis(
+                            engine,
+                            len(faces),
+                            original.shape[1],
+                            original.shape[0],
+                            result,
+                        )
 
-with image_col2:
-    if show_landmarks:
-        show_image(annotated_rgb, "Landmark Visualization")
-    else:
-        st.info("Enable landmark visualization in Settings.")
+                    st.success("Analysis summary saved.")
+                except Exception as exc:
+                    st.error(f"Unable to save analysis: {exc}")
 
-if not face_data:
-    st.warning(
-        "No face was detected. Try an image with a clearly visible face."
-    )
-    st.stop()
+        st.download_button(
+            "Download analysis CSV",
+            data=summary.to_csv(index=False).encode("utf-8"),
+            file_name="analysis_summary.csv",
+            mime="text/csv",
+        )
 
-st.subheader("Facial Feature Measurements")
+        if show_coordinates:
+            coordinates = pd.DataFrame(
+                faces[selected_index]["landmarks"]
+            )
+            coordinates.insert(
+                0,
+                "landmark_index",
+                range(len(coordinates)),
+            )
 
-selected_index = st.selectbox(
-    "Select face",
-    options=list(range(len(face_data))),
-    format_func=lambda index: f"Face {index + 1}",
-)
+            st.subheader("Landmark Coordinates")
+            st.dataframe(
+                coordinates,
+                use_container_width=True,
+                hide_index=True,
+            )
 
-selected = analyses[selected_index]
+            st.download_button(
+                "Download coordinates CSV",
+                data=coordinates.to_csv(index=False).encode("utf-8"),
+                file_name="landmark_coordinates.csv",
+                mime="text/csv",
+            )
 
-st.caption(
-    "Measurements are relative image-coordinate estimates, "
-    "not physical dimensions or identity verification."
-)
+if show_history and engine is not None:
+    st.subheader("Saved Analysis History")
 
-m1, m2, m3, m4 = st.columns(4)
+    try:
+        history = load_history(engine)
 
-m1.metric(
-    "Eye center distance",
-    format_percent(selected["eye_distance"]),
-)
-m2.metric(
-    "Face width",
-    format_percent(selected["face_width"]),
-)
-m3.metric(
-    "Face height",
-    format_percent(selected["face_height"]),
-)
-m4.metric(
-    "Width / height ratio",
-    f'{selected["width_height_ratio"]:.3f}'
-    if selected["width_height_ratio"] is not None
-    else "N/A",
-)
+        if history.empty:
+            st.info("No saved records yet.")
+        else:
+            st.dataframe(
+                history,
+                use_container_width=True,
+                hide_index=True,
+            )
 
-m5, m6 = st.columns(2)
-
-m5.metric(
-    "Mouth opening distance",
-    format_percent(selected["mouth_gap"]),
-)
-
-offset = selected["nose_offset"]
-
-m6.metric(
-    "Nose offset from eye midpoint",
-    f'x: {offset["x"]:+.4f}, y: {offset["y"]:+.4f}'
-    if offset else "N/A",
-)
-
-st.subheader("Face Summary")
-
-summary_rows = []
-
-for result in analyses:
-    summary_rows.append({
-        "Face": result["face_index"] + 1,
-        "Landmarks": result["landmark_count"],
-        "Eye distance (%)": (
-            round(result["eye_distance"] * 100, 2)
-            if result["eye_distance"] is not None else None
-        ),
-        "Face width (%)": (
-            round(result["face_width"] * 100, 2)
-            if result["face_width"] is not None else None
-        ),
-        "Face height (%)": (
-            round(result["face_height"] * 100, 2)
-            if result["face_height"] is not None else None
-        ),
-        "Width/height ratio": (
-            round(result["width_height_ratio"], 3)
-            if result["width_height_ratio"] is not None else None
-        ),
-    })
-
-summary_df = pd.DataFrame(summary_rows)
-
-st.dataframe(
-    summary_df,
-    use_container_width=True,
-    hide_index=True,
-)
-
-st.subheader("Export Analysis")
-
-st.download_button(
-    "Download analysis summary CSV",
-    data=summary_df.to_csv(index=False).encode("utf-8"),
-    file_name="face_analysis_summary.csv",
-    mime="text/csv",
-)
-
-if show_coordinates:
-    st.subheader("Landmark Coordinates")
-
-    landmarks_df = pd.DataFrame(
-        face_data[selected_index]["landmarks"]
-    )
-
-    landmarks_df.insert(
-        0,
-        "landmark_index",
-        range(len(landmarks_df)),
-    )
-
-    st.dataframe(
-        landmarks_df,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    st.download_button(
-        "Download landmark coordinates CSV",
-        data=landmarks_df.to_csv(index=False).encode("utf-8"),
-        file_name=f"face_{selected_index + 1}_landmarks.csv",
-        mime="text/csv",
-    )
+            st.download_button(
+                "Download history CSV",
+                data=history.to_csv(index=False).encode("utf-8"),
+                file_name="analysis_history.csv",
+                mime="text/csv",
+            )
+    except Exception as exc:
+        st.error(f"Unable to load history: {exc}")
