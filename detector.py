@@ -5,7 +5,6 @@ import urllib.request
 import cv2
 import numpy as np
 import mediapipe as mp
-
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
@@ -20,14 +19,22 @@ MODEL_URL = (
 )
 
 
+NOSE_CONNECTIONS = [
+    (168, 6), (6, 197), (197, 195), (195, 5),
+    (5, 4), (4, 1), (1, 19), (19, 94),
+    (94, 2), (2, 164), (164, 0),
+    (98, 97), (97, 2), (2, 326), (326, 327),
+    (129, 98), (98, 64), (64, 48),
+    (358, 327), (327, 294), (294, 278),
+]
+
+
 def ensure_model():
-    """모델 파일이 없으면 다운로드한다."""
     if not MODEL_PATH.exists() or MODEL_PATH.stat().st_size == 0:
         urllib.request.urlretrieve(MODEL_URL, str(MODEL_PATH))
 
 
 def draw_connections(image, landmarks, connections, color, thickness=1):
-    """랜드마크 연결선을 이미지에 그린다."""
     height, width = image.shape[:2]
 
     for connection in connections:
@@ -49,22 +56,7 @@ def draw_connections(image, landmarks, connections, color, thickness=1):
         cv2.line(image, p1, p2, color, thickness, cv2.LINE_AA)
 
 
-# 코 윤곽과 콧등을 강조하기 위한 랜드마크 연결선
-# MediaPipe Face Landmarker의 표준 478개 랜드마크 인덱스 기준
-NOSE_CONNECTIONS = [
-    (168, 6), (6, 197), (197, 195), (195, 5),
-    (5, 4), (4, 1), (1, 19), (19, 94),
-    (94, 2), (2, 164), (164, 0),
-    (98, 97), (97, 2), (2, 326), (326, 327),
-    (129, 98), (98, 64), (64, 48),
-    (358, 327), (327, 294), (294, 278),
-    (48, 64), (64, 98), (98, 97),
-    (278, 294), (294, 327), (327, 326),
-]
-
-
-def draw_nose_connections(image, landmarks, color, thickness=2):
-    """코 랜드마크를 직접 연결한다."""
+def draw_nose(image, landmarks, color=(255, 0, 255), thickness=2):
     height, width = image.shape[:2]
 
     for start, end in NOSE_CONNECTIONS:
@@ -83,14 +75,79 @@ def draw_nose_connections(image, landmarks, color, thickness=2):
         cv2.line(image, p1, p2, color, thickness, cv2.LINE_AA)
 
 
+def draw_point(image, landmark, color, radius=3):
+    height, width = image.shape[:2]
+
+    point = (
+        int(landmark.x * width),
+        int(landmark.y * height),
+    )
+
+    cv2.circle(image, point, radius, color, -1, cv2.LINE_AA)
+
+
+def draw_measurement(image, landmarks):
+    height, width = image.shape[:2]
+
+    if len(landmarks) <= 454:
+        return
+
+    left_eye_ids = [33, 133, 159, 145]
+    right_eye_ids = [362, 263, 386, 374]
+
+    def center(indices):
+        points = np.array([
+            [landmarks[i].x * width, landmarks[i].y * height]
+            for i in indices
+        ])
+
+        return tuple(np.round(points.mean(axis=0)).astype(int))
+
+    left_eye = center(left_eye_ids)
+    right_eye = center(right_eye_ids)
+    face_left = (
+        int(landmarks[234].x * width),
+        int(landmarks[234].y * height),
+    )
+    face_right = (
+        int(landmarks[454].x * width),
+        int(landmarks[454].y * height),
+    )
+    face_top = (
+        int(landmarks[10].x * width),
+        int(landmarks[10].y * height),
+    )
+    face_bottom = (
+        int(landmarks[152].x * width),
+        int(landmarks[152].y * height),
+    )
+
+    cv2.line(image, left_eye, right_eye, (0, 255, 255), 2, cv2.LINE_AA)
+    cv2.line(image, face_left, face_right, (255, 255, 0), 2, cv2.LINE_AA)
+
+    center_x = (face_top[0] + face_bottom[0]) // 2
+
+    cv2.line(
+        image,
+        (center_x, face_top[1]),
+        (center_x, face_bottom[1]),
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+
+    for point in (left_eye, right_eye):
+        cv2.circle(image, point, 5, (0, 255, 255), -1, cv2.LINE_AA)
+
+
 def detect_faces(image_rgb):
-    """얼굴 메시와 주요 부위 윤곽을 표시한다."""
     if image_rgb is None or image_rgb.size == 0:
-        raise ValueError("유효한 이미지를 입력해야 합니다.")
+        raise ValueError("A valid image is required.")
 
     if image_rgb.ndim != 3 or image_rgb.shape[2] != 3:
-        raise ValueError("RGB 3채널 이미지를 입력해야 합니다.")
+        raise ValueError("The image must have three RGB channels.")
 
+    image_rgb = np.ascontiguousarray(image_rgb, dtype=np.uint8)
     ensure_model()
 
     options = vision.FaceLandmarkerOptions(
@@ -99,12 +156,12 @@ def detect_faces(image_rgb):
         ),
         running_mode=vision.RunningMode.IMAGE,
         num_faces=5,
-        output_face_blendshapes=True,
+        output_face_blendshapes=False,
     )
 
     mp_image = mp.Image(
         image_format=mp.ImageFormat.SRGB,
-        data=np.ascontiguousarray(image_rgb),
+        data=image_rgb,
     )
 
     with vision.FaceLandmarker.create_from_options(options) as landmarker:
@@ -113,97 +170,72 @@ def detect_faces(image_rgb):
     annotated_rgb = image_rgb.copy()
     face_data = []
 
-    tessellation = (
-        vision.FaceLandmarksConnections.FACE_LANDMARKS_TESSELATION
-    )
-
-    contour_groups = [
+    connections = [
         (
             vision.FaceLandmarksConnections.FACE_LANDMARKS_FACE_OVAL,
-            (255, 200, 0),
+            (0, 255, 255),
             2,
         ),
         (
             vision.FaceLandmarksConnections.FACE_LANDMARKS_LEFT_EYE,
-            (255, 0, 0),
+            (255, 80, 0),
             2,
         ),
         (
             vision.FaceLandmarksConnections.FACE_LANDMARKS_RIGHT_EYE,
-            (255, 0, 0),
+            (255, 80, 0),
             2,
         ),
         (
             vision.FaceLandmarksConnections.FACE_LANDMARKS_LEFT_EYEBROW,
-            (255, 100, 0),
+            (0, 180, 255),
             2,
         ),
         (
             vision.FaceLandmarksConnections.FACE_LANDMARKS_RIGHT_EYEBROW,
-            (255, 100, 0),
+            (0, 180, 255),
             2,
         ),
         (
             vision.FaceLandmarksConnections.FACE_LANDMARKS_LIPS,
-            (255, 255, 0),
+            (0, 255, 0),
             2,
         ),
     ]
 
     for face_index, landmarks in enumerate(result.face_landmarks):
-        # 1. 얼굴 전체 메시
         draw_connections(
             annotated_rgb,
             landmarks,
-            tessellation,
-            color=(100, 220, 100),
-            thickness=1,
+            vision.FaceLandmarksConnections.FACE_LANDMARKS_TESSELATION,
+            (100, 160, 100),
+            1,
         )
 
-        # 2. 눈썹, 눈, 입, 얼굴 윤곽
-        for connections, color, thickness in contour_groups:
+        for group, color, thickness in connections:
             draw_connections(
                 annotated_rgb,
                 landmarks,
-                connections,
-                color=color,
-                thickness=thickness,
+                group,
+                color,
+                thickness,
             )
 
-        # 3. 코 연결선
-        draw_nose_connections(
-            annotated_rgb,
-            landmarks,
-            color=(255, 0, 255),
-            thickness=2,
-        )
+        draw_nose(annotated_rgb, landmarks)
+        draw_measurement(annotated_rgb, landmarks)
 
-        # 4. 모든 랜드마크 점과 좌표
-        height, width = annotated_rgb.shape[:2]
         points = []
 
         for landmark in landmarks:
-            x = int(landmark.x * width)
-            y = int(landmark.y * height)
-
             points.append({
                 "x": round(float(landmark.x), 6),
                 "y": round(float(landmark.y), 6),
                 "z": round(float(landmark.z), 6),
             })
 
-            cv2.circle(
-                annotated_rgb,
-                (x, y),
-                1,
-                (255, 255, 255),
-                -1,
-                cv2.LINE_AA,
-            )
-
         face_data.append({
             "face_index": face_index,
-            "landmark_count": len(landmarks),
+            "landmark_count": len(points),
             "landmarks": points,
         })
 
