@@ -1,7 +1,9 @@
 
+import base64
+import io
+
 import streamlit as st
 from PIL import Image
-import io
 
 st.set_page_config(page_title="Image Test", layout="wide")
 st.title("Image Rendering Test")
@@ -13,13 +15,29 @@ uploaded = st.file_uploader(
 
 if uploaded is not None:
     try:
-        image_bytes = uploaded.getvalue()
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        image = Image.open(io.BytesIO(uploaded.getvalue()))
+        image = image.convert("RGB")
 
-        st.write("Image loaded successfully")
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+
+        encoded = base64.b64encode(
+            buffer.getvalue()
+        ).decode("ascii")
+
         st.write("Image size:", image.size)
 
-        st.image(image, caption="Test image")
+        st.html(
+            f"""
+            <div style="width:100%; overflow:hidden;">
+                <img
+                    src="data:image/png;base64,{encoded}"
+                    alt="Uploaded image"
+                    style="display:block; width:100%; height:auto;"
+                />
+            </div>
+            """
+        )
 
-    except Exception as e:
-        st.error(f"Image loading failed: {e}")
+    except Exception as exc:
+        st.error(f"Image display failed: {exc}")
