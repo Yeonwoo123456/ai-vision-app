@@ -1,13 +1,10 @@
 import base64
 import io
-import os
-from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 from PIL import Image, ImageOps
-from sqlalchemy import create_engine, text
 from detector import detect_faces
 
 
@@ -15,57 +12,6 @@ st.set_page_config(
     page_title="AI Vision Lab",
     layout="wide",
 )
-
-
-def get_database_url():
-    try:
-        url = st.secrets.get("DATABASE_URL", "")
-    except Exception:
-        url = ""
-
-    if not url:
-        url = os.environ.get("DATABASE_URL", "")
-
-    if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql+psycopg://", 1)
-    elif url.startswith("postgresql://"):
-        url = url.replace("postgresql://", "postgresql+psycopg://", 1)
-
-    return url
-
-
-@st.cache_resource
-def get_engine():
-    url = get_database_url()
-
-    if not url:
-        return None
-
-    return create_engine(
-        url,
-        pool_pre_ping=True,
-        pool_recycle=300,
-    )
-
-
-def initialize_database(engine):
-    with engine.begin() as connection:
-        connection.execute(text("""
-            CREATE TABLE IF NOT EXISTS analysis_history (
-                id BIGSERIAL PRIMARY KEY,
-                created_at TEXT NOT NULL,
-                face_count INTEGER NOT NULL,
-                image_width INTEGER NOT NULL,
-                image_height INTEGER NOT NULL,
-                face_index INTEGER NOT NULL,
-                landmark_count INTEGER NOT NULL,
-                eye_distance DOUBLE PRECISION,
-                face_width DOUBLE PRECISION,
-                face_height DOUBLE PRECISION,
-                width_height_ratio DOUBLE PRECISION,
-                mouth_gap DOUBLE PRECISION
-            )
-        """))
 
 
 def load_image(uploaded_file):
@@ -186,51 +132,6 @@ def pct(value):
     return f"{value * 100:.2f}%" if value is not None else "N/A"
 
 
-def save_analysis(engine, face_count, width, height, result):
-    created_at = datetime.now(timezone.utc).isoformat()
-
-    with engine.begin() as connection:
-        connection.execute(
-            text("""
-                INSERT INTO analysis_history (
-                    created_at, face_count, image_width, image_height,
-                    face_index, landmark_count, eye_distance,
-                    face_width, face_height, width_height_ratio, mouth_gap
-                )
-                VALUES (
-                    :created_at, :face_count, :image_width, :image_height,
-                    :face_index, :landmark_count, :eye_distance,
-                    :face_width, :face_height, :width_height_ratio, :mouth_gap
-                )
-            """),
-            {
-                "created_at": created_at,
-                "face_count": face_count,
-                "image_width": width,
-                "image_height": height,
-                **result,
-            },
-        )
-
-
-def load_history(engine, limit=100):
-    with engine.connect() as connection:
-        result = connection.execute(
-            text("""
-                SELECT id, created_at, face_count, image_width,
-                       image_height, face_index, landmark_count,
-                       eye_distance, face_width, face_height,
-                       width_height_ratio, mouth_gap
-                FROM analysis_history
-                ORDER BY id DESC
-                LIMIT :limit
-            """),
-            {"limit": limit},
-        )
-
-        return pd.DataFrame(result.mappings().all())
-
-
 st.title("AI Vision Lab")
 st.caption("Facial Landmark Analysis")
 
@@ -252,10 +153,6 @@ with st.sidebar:
         value=False,
     )
 
-    show_history = st.checkbox(
-        "Show saved analysis history",
-        value=True,
-    )
 
 uploaded_file = (
     st.camera_input("Take a picture")
@@ -265,27 +162,6 @@ uploaded_file = (
         type=["jpg", "jpeg", "png", "webp"],
     )
 )
-
-engine = None
-database_error = None
-
-try:
-    engine = get_engine()
-
-    if engine is not None:
-        initialize_database(engine)
-except Exception as exc:
-    database_error = str(exc)
-    engine = None
-
-if engine is None:
-    st.warning(
-        "Persistent database is not connected. "
-        "Configure DATABASE_URL to enable saved history."
-    )
-
-    if database_error:
-        st.error(f"Database connection failed: {database_error}")
 
 if uploaded_file is not None:
     try:
@@ -384,22 +260,6 @@ if uploaded_file is not None:
         st.subheader("Face Summary")
         st.dataframe(summary, use_container_width=True, hide_index=True)
 
-        if engine is not None:
-            if st.button("Save analysis to database"):
-                try:
-                    for result in analyses:
-                        save_analysis(
-                            engine,
-                            len(faces),
-                            original.shape[1],
-                            original.shape[0],
-                            result,
-                        )
-
-                    st.success("Analysis summary saved.")
-                except Exception as exc:
-                    st.error(f"Unable to save analysis: {exc}")
-
         st.download_button(
             "Download analysis CSV",
             data=summary.to_csv(index=False).encode("utf-8"),
@@ -430,126 +290,3 @@ if uploaded_file is not None:
                 file_name="landmark_coordinates.csv",
                 mime="text/csv",
             )
-
-if show_history and engine is not None:
-    st.divider()
-    st.header("Analysis Dashboard")
-    st.caption("Explore saved measurements, compare records, and export filtered data.")
-
-    try:
-        history = load_history(engine, limit=1000)
-
-        if history.empty:
-            st.info("No saved records yet. Analyze an image and click 'Save analysis to database' first.")
-        else:
-            history["created_at"] = pd.to_datetime(
-                history["created_at"], errors="coerce", utc=True
-            ).dt.tz_convert(None)
-            history = history.dropna(subset=["created_at"]).copy()
-
-            if history.empty:
-                st.info("Saved records were found, but their timestamps could not be read.")
-            else:
-                min_day = history["created_at"].min().date()
-                max_day = history["created_at"].max().date()
-
-                metric_options = {
-                    "Eye distance": "eye_distance",
-                    "Face width": "face_width",
-                    "Face height": "face_height",
-                    "Width / height ratio": "width_height_ratio",
-                    "Mouth opening": "mouth_gap",
-                    "Faces detected": "face_count",
-                    "Landmark count": "landmark_count",
-                }
-
-                with st.expander("Filter records", expanded=True):
-                    f1, f2, f3 = st.columns([1, 1, 1.4])
-                    start_day = f1.date_input(
-                        "Start date", value=min_day, min_value=min_day,
-                        max_value=max_day, key="history_start_date",
-                    )
-                    end_day = f2.date_input(
-                        "End date", value=max_day, min_value=min_day,
-                        max_value=max_day, key="history_end_date",
-                    )
-                    metric_label = f3.selectbox(
-                        "Metric for chart", list(metric_options.keys()),
-                        index=4, key="history_chart_metric",
-                    )
-
-                if start_day > end_day:
-                    st.error("Start date must be on or before end date.")
-                    filtered = history.iloc[0:0].copy()
-                else:
-                    start_dt = pd.Timestamp(start_day)
-                    end_dt = pd.Timestamp(end_day) + pd.Timedelta(days=1)
-                    filtered = history[
-                        (history["created_at"] >= start_dt)
-                        & (history["created_at"] < end_dt)
-                    ].copy()
-
-                metric_col = metric_options[metric_label]
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Records in range", f"{len(filtered):,}")
-                m2.metric(
-                    "Unique analysis times",
-                    f"{filtered['created_at'].nunique():,}" if not filtered.empty else "0",
-                )
-                values = (
-                    pd.to_numeric(filtered[metric_col], errors="coerce").dropna()
-                    if not filtered.empty else pd.Series(dtype=float)
-                )
-                m3.metric(
-                    f"Average {metric_label.lower()}",
-                    f"{values.mean():.4f}" if not values.empty else "N/A",
-                )
-
-                if filtered.empty:
-                    st.info("No records match the selected date range.")
-                else:
-                    st.subheader(f"{metric_label} over time")
-                    chart_data = filtered[["created_at", metric_col]].copy()
-                    chart_data[metric_col] = pd.to_numeric(
-                        chart_data[metric_col], errors="coerce"
-                    )
-                    chart_data = chart_data.dropna(subset=[metric_col]).sort_values("created_at")
-                    if chart_data.empty:
-                        st.info("There are no numeric values for this metric in the selected range.")
-                    else:
-                        chart_data = chart_data.set_index("created_at")
-                        st.line_chart(chart_data, y=metric_col, use_container_width=True)
-
-                    st.subheader("Filtered records")
-                    display_history = filtered.sort_values(
-                        "created_at", ascending=False
-                    ).copy()
-                    display_history["created_at"] = display_history["created_at"].dt.strftime(
-                        "%Y-%m-%d %H:%M:%S UTC"
-                    )
-                    st.dataframe(display_history, use_container_width=True, hide_index=True)
-                    st.download_button(
-                        "Download filtered history CSV",
-                        data=display_history.to_csv(index=False).encode("utf-8-sig"),
-                        file_name="filtered_analysis_history.csv",
-                        mime="text/csv",
-                        key="download_filtered_history_csv",
-                    )
-
-                    with st.expander("Show all recent records (up to 1,000)"):
-                        all_history = history.sort_values(
-                            "created_at", ascending=False
-                        ).copy()
-                        all_history["created_at"] = all_history["created_at"].dt.strftime(
-                            "%Y-%m-%d %H:%M:%S UTC"
-                        )
-                        st.dataframe(all_history, use_container_width=True, hide_index=True)
-                        st.download_button(
-                            "Download all recent history CSV",
-                            data=all_history.to_csv(index=False).encode("utf-8-sig"),
-                            file_name="analysis_history.csv",
-                            mime="text/csv",
-                            key="download_all_history_csv",
-                        )
-    except Exception as exc:
-        st.error(f"Unable to load history dashboard: {exc}")
