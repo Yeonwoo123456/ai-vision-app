@@ -1,8 +1,3 @@
-"""UI and visual design helpers for AI Vision Lab.
-
-Keep visual styling, page configuration, shared header/sidebar controls, and
-image rendering here. Keep database/model logic in app.py.
-"""
 
 import base64
 import io
@@ -11,13 +6,10 @@ import numpy as np
 import streamlit as st
 from PIL import Image
 
-
 def configure_page():
-    """Configure Streamlit page and apply global visual styling."""
     st.set_page_config(
         page_title="AI Vision Lab",
-        page_icon="🔬",
-        layout="wide",
+                layout="wide",
         initial_sidebar_state="expanded",
     )
     st.markdown(
@@ -61,17 +53,13 @@ def configure_page():
         unsafe_allow_html=True,
     )
 
-
 def render_header():
-    """Render the shared app header."""
-    st.title("🔬 AI Vision Lab")
+    st.title("AI Vision Lab")
     st.caption("Facial Landmark Analysis · Profile Matching · AI Explanation")
 
-
 def render_sidebar():
-    """Render display controls and return their values to app.py."""
     with st.sidebar:
-        st.header("⚙️ Settings")
+        st.header(" Settings")
         source = st.radio(
             "Image source",
             ["Camera", "Upload image"],
@@ -98,9 +86,7 @@ def render_sidebar():
         st.caption("Images are processed in memory. Profile embeddings and user-entered profile details may be saved to the configured database.")
     return source, show_landmarks, show_coordinates, show_measurements
 
-
 def show_image(image, caption):
-    """Render an RGB image with a caption using a base64 data URL."""
     image = np.asarray(image)
     if image.ndim != 3 or image.shape[2] != 3:
         raise ValueError("Expected an RGB image.")
@@ -123,9 +109,7 @@ def show_image(image, caption):
         """
     )
 
-
 def section_heading(title, description=None):
-    """Render a consistent section heading and optional description."""
     st.subheader(title)
     if description:
         st.markdown(f'<div class="vision-caption">{description}</div>', unsafe_allow_html=True)
