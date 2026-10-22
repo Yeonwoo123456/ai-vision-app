@@ -6,3 +6,4 @@ pillow
 pandas
 sqlalchemy
 psycopg[binary]
+openai
