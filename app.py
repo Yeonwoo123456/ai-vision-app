@@ -74,12 +74,16 @@ def initialize_database(engine):
             CREATE TABLE IF NOT EXISTS face_profiles (
                 id BIGSERIAL PRIMARY KEY,
                 alias TEXT NOT NULL,
+                name TEXT,
                 description TEXT NOT NULL DEFAULT '',
                 notes TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
         """))
+        # Backward-compatible migration: old profiles used alias; new UI uses name.
+        connection.execute(text("ALTER TABLE face_profiles ADD COLUMN IF NOT EXISTS name TEXT"))
+        connection.execute(text("UPDATE face_profiles SET name = alias WHERE name IS NULL OR name = ''"))
         connection.execute(text("""
             CREATE TABLE IF NOT EXISTS face_profile_embeddings (
                 id BIGSERIAL PRIMARY KEY,
@@ -132,7 +136,7 @@ def load_saved_analyses(engine):
             SELECT h.id, h.created_at, h.face_count, h.image_width, h.image_height,
                    h.face_index, h.landmark_count, h.eye_distance, h.face_width,
                    h.face_height, h.width_height_ratio, h.mouth_gap, h.profile_id,
-                   p.alias AS profile_alias
+                   COALESCE(NULLIF(p.name, ''), p.alias) AS profile_name
             FROM analysis_history h
             LEFT JOIN face_profiles p ON p.id = h.profile_id
             ORDER BY h.id ASC
@@ -172,7 +176,7 @@ def get_identity_faces(image_rgb):
 def load_face_profiles(engine):
     with engine.connect() as connection:
         rows = connection.execute(text("""
-            SELECT p.id, p.alias, p.description, p.notes, e.embedding
+            SELECT p.id, COALESCE(NULLIF(p.name, ''), p.alias) AS name, p.description, p.notes, e.embedding
             FROM face_profiles p
             LEFT JOIN face_profile_embeddings e ON e.profile_id = p.id
             ORDER BY p.id, e.id
@@ -183,7 +187,7 @@ def load_face_profiles(engine):
         if profile_id not in profiles:
             profiles[profile_id] = {
                 "id": profile_id,
-                "alias": row["alias"],
+                "name": row["name"],
                 "description": row["description"] or "",
                 "notes": row["notes"] or "",
                 "embeddings": [],
@@ -198,17 +202,17 @@ def load_face_profiles(engine):
     return list(profiles.values())
 
 
-def create_face_profile(engine, alias, description, notes, embedding):
+def create_face_profile(engine, name, description, notes, embedding):
     now = datetime.now(timezone.utc).isoformat()
     normalized = np.asarray(embedding, dtype=np.float32)
     normalized = normalized / max(float(np.linalg.norm(normalized)), 1e-12)
     with engine.begin() as connection:
         profile_id = connection.execute(text("""
-            INSERT INTO face_profiles (alias, description, notes, created_at, updated_at)
-            VALUES (:alias, :description, :notes, :created_at, :updated_at)
+            INSERT INTO face_profiles (alias, name, description, notes, created_at, updated_at)
+            VALUES (:alias, :name, :description, :notes, :created_at, :updated_at)
             RETURNING id
         """), {
-            "alias": alias.strip(), "description": description.strip(), "notes": notes.strip(),
+            "alias": name.strip(), "name": name.strip(), "description": description.strip(), "notes": notes.strip(),
             "created_at": now, "updated_at": now,
         }).scalar_one()
         connection.execute(text("""
@@ -312,7 +316,7 @@ def load_profile_analyses(engine, profile_id):
             SELECT h.id, h.created_at, h.face_count, h.image_width, h.image_height,
                    h.face_index, h.landmark_count, h.eye_distance, h.face_width,
                    h.face_height, h.width_height_ratio, h.mouth_gap,
-                   h.profile_id, p.alias AS profile_alias
+                   h.profile_id, COALESCE(NULLIF(p.name, ''), p.alias) AS profile_name
             FROM analysis_history h
             JOIN face_profiles p ON p.id = h.profile_id
             WHERE h.profile_id = :profile_id
@@ -554,8 +558,8 @@ def get_gemini_settings():
     return api_key, model
 
 
-def generate_ai_measurement_explanation(measurements, image_width, image_height):
-    """Explain numeric measurements with Gemini; the image itself is never sent."""
+def generate_ai_measurement_explanation(measurements, image_width, image_height, profile_context=None):
+    """Explain current measurements in the context of a saved user-provided profile; no image is sent."""
     api_key, model = get_gemini_settings()
     if not api_key:
         raise ValueError("Gemini API key is not configured. Add GEMINI_API_KEY to Streamlit Secrets.")
@@ -574,17 +578,31 @@ def generate_ai_measurement_explanation(measurements, image_width, image_height)
         "measurement_note": "Relative distances are normalized by the image diagonal, not physical measurements.",
     }
 
+    profile_context = profile_context or {}
+    profile_payload = {
+        "saved_profile_name": profile_context.get("name"),
+        "user_provided_description": profile_context.get("description", ""),
+        "user_provided_notes": profile_context.get("notes", ""),
+        "match_similarity_score": profile_context.get("similarity"),
+        "profile_match_status": profile_context.get("status", "no confirmed profile match"),
+    }
     prompt = (
-        "You are the AI Vision Lab measurement explainer. Explain the supplied computer-vision "
-        "measurements clearly and conservatively. Only numeric measurements are provided; no image is sent. "
-        "Explain what each metric represents and what can or cannot be inferred. Do not infer identity, age, "
-        "ethnicity, attractiveness, personality, health, emotion, or other personal traits. Do not claim the "
-        "values are centimeters or inches. Relative distances are normalized by the image diagonal and can "
-        "be affected by pose, perspective, image quality, and landmark estimation error. Comparisons require "
-        "consistent camera angle, pose, and image conditions. Use short headings and plain language. "
-        "If a value is null, state that it was unavailable. Distinguish data from interpretation.\n\n"
-        "Explain these measured results without inventing missing values:\n\n"
-        + pd.Series(payload).to_json(force_ascii=False, indent=2)
+        "You are the AI Vision Lab profile-aware explanation assistant. Explain the newly submitted face's "
+        "available landmark measurements in the context of the saved profile information below. The image "
+        "itself is NOT sent to you. The profile name, description, and notes are user-provided metadata, not "
+        "verified facts. Clearly distinguish stored user-provided information from the current image's numeric "
+        "measurements. If a candidate profile is unconfirmed, describe it only as a possible match and never "
+        "state that it is definitely the same person. Similarity score is model-specific and is not a probability. "
+        "Do not infer identity, age, ethnicity, attractiveness, personality, health, emotion, or other sensitive "
+        "personal traits. Do not invent visual details because you cannot see the image. Do not claim values are "
+        "centimeters or inches. Relative distances are normalized by the image diagonal and affected by pose, "
+        "perspective, image quality, and landmark estimation error. Use concise plain language with headings: "
+        "Saved profile context, Current measurement summary, and Limitations. If there is no saved profile match, "
+        "say so. If a value is null, state it was unavailable.\n\n"
+        "Saved profile context:\n"
+        + json.dumps(profile_payload, ensure_ascii=False, indent=2)
+        + "\n\nCurrent image measurements (no image provided):\n"
+        + json.dumps(payload, ensure_ascii=False, indent=2)
     )
 
     client = genai.Client(api_key=api_key)
@@ -703,9 +721,61 @@ if uploaded_file is not None:
         )
         if st.button("Generate AI explanation", key="generate_ai_measurement_explanation"):
             try:
-                with st.spinner("Generating explanation with Gemini..."):
+                with st.spinner("Generating profile-aware explanation with Gemini..."):
+                    profile_context = {}
+                    if db_engine is not None:
+                        identity_faces_for_ai = get_identity_faces(original)
+                        saved_profiles_for_ai = load_face_profiles(db_engine)
+                        matched_identity = None
+                        for identity_face in identity_faces_for_ai:
+                            mapped_index = map_identity_face_to_measurement_face(
+                                identity_face, faces, original.shape[1], original.shape[0]
+                            )
+                            if mapped_index == selected_index:
+                                matched_identity = identity_face
+                                break
+                        if matched_identity is not None:
+                            confirmed_profile_id = st.session_state.get("confirmed_profile_id_for_current_image")
+                            confirmed_profile_fingerprint = st.session_state.get("confirmed_profile_image_fingerprint")
+                            confirmed_measurement_index = st.session_state.get("confirmed_profile_face_index")
+                            confirmed_identity_index = st.session_state.get("confirmed_profile_identity_index")
+                            active_identity_index = next(
+                                (i for i, identity_face in enumerate(identity_faces_for_ai)
+                                 if identity_face is matched_identity), None
+                            )
+                            confirmed_profile = next(
+                                (profile for profile in saved_profiles_for_ai
+                                 if profile["id"] == confirmed_profile_id), None
+                            )
+                            if (
+                                confirmed_profile is not None
+                                and confirmed_profile_fingerprint == current_image_fingerprint
+                                and confirmed_measurement_index == selected_index
+                                and confirmed_identity_index == active_identity_index
+                            ):
+                                profile_context = {
+                                    "name": confirmed_profile["name"],
+                                    "description": confirmed_profile["description"],
+                                    "notes": confirmed_profile["notes"],
+                                    "similarity": None,
+                                    "status": "user-confirmed match for this exact uploaded image and selected face",
+                                }
+                            else:
+                                profile_matches_for_ai = find_face_profile_matches(
+                                    matched_identity["embedding"], saved_profiles_for_ai
+                                )
+                                if profile_matches_for_ai:
+                                    top_profile = profile_matches_for_ai[0]
+                                    if top_profile["similarity"] >= 0.45:
+                                        profile_context = {
+                                            "name": top_profile["name"],
+                                            "description": top_profile["description"],
+                                            "notes": top_profile["notes"],
+                                            "similarity": top_profile["similarity"],
+                                            "status": "possible match; not user-confirmed for this image",
+                                        }
                     explanation = generate_ai_measurement_explanation(
-                        selected, original.shape[1], original.shape[0]
+                        selected, original.shape[1], original.shape[0], profile_context
                     )
                 st.session_state["ai_measurement_explanation"] = explanation
                 st.session_state["ai_measurement_explanation_face"] = selected_index
@@ -789,7 +859,7 @@ if uploaded_file is not None:
 
 
 # Same-person profile matching is an opt-in, separate feature. The raw image is processed
-# locally; only the numeric embedding and user-entered alias/description/notes are persisted.
+# locally; only the numeric embedding and user-entered name/description/notes are persisted.
 if uploaded_file is not None and db_engine is not None:
     st.divider()
     st.subheader("Face Identity Profiles")
@@ -821,7 +891,7 @@ if uploaded_file is not None and db_engine is not None:
 
             if candidate:
                 st.markdown("**Possible saved profile**")
-                st.write(f"Alias: {candidate['alias']}")
+                st.write(f"Name: {candidate['name']}")
                 if candidate["description"]:
                     st.write(f"Description: {candidate['description']}")
                 if candidate["notes"]:
@@ -833,26 +903,26 @@ if uploaded_file is not None and db_engine is not None:
             elif matches:
                 st.info("No strong candidate reached the initial matching threshold. You can review the closest candidates below.")
                 for match in matches[:3]:
-                    st.write(f"{match['alias']} — similarity {match['similarity']:.3f}")
+                    st.write(f"{match['name']} — similarity {match['similarity']:.3f}")
             else:
                 st.info("No saved face profiles yet. Create a profile below to start your private gallery.")
 
             with st.expander("Create a new face profile", expanded=not bool(candidate)):
                 with st.form("create_face_profile_form"):
-                    new_alias = st.text_input("Alias (required)", max_chars=100)
+                    new_name = st.text_input("Name (required)", max_chars=100)
                     new_description = st.text_area("Description", max_chars=1000)
                     new_notes = st.text_area("Notes", max_chars=3000)
                     confirm_save = st.checkbox("I have permission to save and compare this face sample.")
                     create_submitted = st.form_submit_button("Save new face profile")
                 if create_submitted:
-                    if not new_alias.strip():
-                        st.error("Enter an alias before saving.")
+                    if not new_name.strip():
+                        st.error("Enter a name before saving.")
                     elif not confirm_save:
                         st.error("Confirm that you have permission to process this face sample.")
                     else:
                         try:
                             profile_id = create_face_profile(
-                                db_engine, new_alias, new_description, new_notes,
+                                db_engine, new_name, new_description, new_notes,
                                 selected_identity["embedding"],
                             )
                             record_profile_review(db_engine, profile_id, current_image_fingerprint, "user_created_profile")
@@ -860,7 +930,7 @@ if uploaded_file is not None and db_engine is not None:
                             st.session_state["confirmed_profile_image_fingerprint"] = current_image_fingerprint
                             st.session_state["confirmed_profile_face_index"] = matched_measurement_index
                             st.session_state["confirmed_profile_identity_index"] = identity_index
-                            st.success(f"Profile '{new_alias.strip()}' saved (ID {profile_id}).")
+                            st.success(f"Profile '{new_name.strip()}' saved (ID {profile_id}).")
                             st.rerun()
                         except Exception as exc:
                             st.error(f"Could not save face profile: {exc}")
@@ -871,7 +941,7 @@ if uploaded_file is not None and db_engine is not None:
                 selected_profile_id = st.selectbox(
                     "Choose profile to add this face sample to",
                     list(profile_by_id.keys()),
-                    format_func=lambda profile_id: profile_by_id[profile_id]["alias"],
+                    format_func=lambda profile_id: profile_by_id[profile_id]["name"],
                     key="profile_sample_target",
                 )
                 confirm_link = st.checkbox(
@@ -916,7 +986,7 @@ if uploaded_file is not None and db_engine is not None:
                 delete_profile_id = st.selectbox(
                     "Choose profile to delete",
                     list(profile_by_id.keys()),
-                    format_func=lambda profile_id: profile_by_id[profile_id]["alias"],
+                    format_func=lambda profile_id: profile_by_id[profile_id]["name"],
                     key="delete_profile_target",
                 )
                 confirm_delete = st.checkbox(
@@ -951,7 +1021,7 @@ if db_engine is not None:
                 data=saved_rows.to_csv(index=False).encode("utf-8-sig"),
                 file_name="analysis_history.csv",
                 mime="text/csv",
-                help="Downloads all saved analysis records, including confirmed profile ID and alias when linked.",
+                help="Downloads all saved analysis records, including confirmed profile ID and profile name when linked.",
                 key="download_accumulated_analysis_csv",
             )
         else:
