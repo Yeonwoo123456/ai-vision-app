@@ -88,6 +88,20 @@ def save_analysis(engine, face_count, width, height, result):
             },
         )
 
+
+def load_saved_analyses(engine):
+    """Load all saved measurement rows so the CSV can accumulate across sessions."""
+    with engine.connect() as connection:
+        result = connection.execute(text("""
+            SELECT id, created_at, face_count, image_width, image_height,
+                   face_index, landmark_count, eye_distance, face_width,
+                   face_height, width_height_ratio, mouth_gap
+            FROM analysis_history
+            ORDER BY id ASC
+        """))
+        return pd.DataFrame(result.mappings().all())
+
+
 def load_image(uploaded_file):
     data = uploaded_file.getvalue()
 
@@ -215,14 +229,10 @@ def draw_measurement_overlay(image, face):
     height, width = image.shape[:2]
     points = face.get("landmarks", [])
 
-    from PIL import ImageDraw, ImageFont
+    from PIL import ImageDraw
 
     canvas = Image.fromarray(image)
     draw = ImageDraw.Draw(canvas)
-    try:
-        font = ImageFont.load_default()
-    except Exception:
-        font = None
 
     def xy(index):
         if index < 0 or index >= len(points):
@@ -301,12 +311,6 @@ def draw_measurement_overlay(image, face):
         draw.line([start, end], fill=color, width=line_width)
         for x, y in (start, end):
             draw.ellipse((x-radius, y-radius, x+radius, y+radius), fill=color, outline="white", width=1)
-        midpoint = ((start[0] + end[0]) // 2, (start[1] + end[1]) // 2)
-        if font:
-            box = draw.textbbox(midpoint, label, font=font, anchor="mm")
-            pad = 3
-            draw.rounded_rectangle((box[0]-pad, box[1]-pad, box[2]+pad, box[3]+pad), radius=3, fill=(20, 20, 20))
-            draw.text(midpoint, label, fill="white", font=font, anchor="mm")
 
     return np.asarray(canvas)
 
@@ -401,14 +405,11 @@ if uploaded_file is not None:
         for detected_face in faces:
             annotated = draw_measurement_overlay(annotated, detected_face)
 
-    left_col, right_col = st.columns(2)
-
-    with left_col:
-        show_image(original, "Original image")
-
-    with right_col:
-        if show_landmarks:
-            show_image(annotated, "Landmark visualization and measurements" if show_measurements else "Landmark visualization")
+    if show_landmarks:
+        st.subheader("Landmark Visualization")
+        if show_measurements and faces:
+            st.caption("Colored lines and endpoints show the measured facial landmarks; measurement labels are hidden.")
+        show_image(annotated, "Landmark Visualization")
 
     if not faces:
         st.warning("No face was detected.")
@@ -491,11 +492,27 @@ if uploaded_file is not None:
                     st.error(f"Unable to save analysis: {exc}")
 
         st.download_button(
-            "Download analysis CSV",
+            "Download current analysis CSV",
             data=summary.to_csv(index=False).encode("utf-8"),
             file_name="analysis_summary.csv",
             mime="text/csv",
         )
+
+        if db_engine is not None:
+            try:
+                saved_rows = load_saved_analyses(db_engine)
+                if not saved_rows.empty:
+                    st.download_button(
+                        "Download accumulated saved data CSV",
+                        data=saved_rows.to_csv(index=False).encode("utf-8-sig"),
+                        file_name="analysis_history.csv",
+                        mime="text/csv",
+                        help="Downloads all analyses previously saved to the database.",
+                    )
+                else:
+                    st.caption("No saved database records yet. Click 'Save analysis to database' to accumulate records.")
+            except Exception as exc:
+                st.warning(f"Could not load accumulated saved data: {exc}")
 
         if show_coordinates:
             coordinates = pd.DataFrame(
