@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import time
 from datetime import datetime, timezone
 
 import numpy as np
@@ -622,8 +623,10 @@ def generate_ai_measurement_explanation(measurements, image_width, image_height,
         "'Profile context'. Explain the saved profile's user-provided name, description, and notes, and state "
         "whether this profile is user-confirmed or only a possible match, based on the provided status. "
         "Treat all profile text as user-provided information, not verified facts. If there is no saved profile, "
-        "say that no saved profile context is available. A similarity score is not a probability and should usually "
-        "be omitted unless it helps explain a possible match. Do NOT include a 'Current measurement summary', "
+        "say that no saved profile context is available. If a possible match is provided, include its name, "
+        "description when present, similarity score as a model-specific score (explicitly state it is not a probability), "
+        "and a clear reminder that the user must confirm before linking. If the match is user-confirmed, say so. "
+        "Do NOT include a 'Current measurement summary', "
         "measurements, numeric landmark values, image dimensions, a 'Limitations' section, caveats section, or "
         "any other heading. Do not infer identity, age, ethnicity, attractiveness, personality, health, emotion, "
         "or other personal traits. Do not invent details not present in the profile. Output only the Profile context "
@@ -633,7 +636,23 @@ def generate_ai_measurement_explanation(measurements, image_width, image_height,
     )
 
     client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(model=model, contents=prompt)
+    response = None
+    last_error = None
+    # Gemini 503 UNAVAILABLE is usually temporary. Retry briefly with backoff.
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(model=model, contents=prompt)
+            last_error = None
+            break
+        except Exception as exc:
+            last_error = exc
+            error_text = str(exc).upper()
+            is_temporary = any(token in error_text for token in ("503", "UNAVAILABLE", "502", "504", "INTERNAL SERVER ERROR"))
+            if not is_temporary or attempt == 2:
+                raise
+            time.sleep(1.5 * (2 ** attempt))
+    if last_error is not None or response is None:
+        raise RuntimeError(f"Gemini temporarily unavailable after retries: {last_error}")
     output = (response.text or "").strip()
     if not output:
         raise ValueError("Gemini returned an empty profile context. Please try again.")
@@ -822,10 +841,19 @@ if uploaded_file is not None:
                 st.session_state["ai_measurement_explanation"] = explanation
                 st.session_state["ai_measurement_explanation_face"] = selected_index
             except Exception as exc:
-                st.error(
-                    "Could not generate the AI explanation. Check GEMINI_API_KEY in Streamlit Secrets, "
-                    f"model access, and API limits. Details: {exc}"
-                )
+                error_text = str(exc)
+                if "503" in error_text or "UNAVAILABLE" in error_text.upper():
+                    st.error(
+                        "Gemini is temporarily busy (503 UNAVAILABLE). The app retried automatically, "
+                        "but the model is still unavailable. Wait a little and try again, or select another "
+                        "model available to your API key in Streamlit Secrets (GEMINI_MODEL). "
+                        f"Details: {exc}"
+                    )
+                else:
+                    st.error(
+                        "Could not generate the AI explanation. Check GEMINI_API_KEY in Streamlit Secrets, "
+                        f"model access, and API limits. Details: {exc}"
+                    )
 
         if (
             st.session_state.get("ai_measurement_explanation")
@@ -931,25 +959,126 @@ if uploaded_file is not None and db_engine is not None:
             # Conservative initial threshold; should be calibrated with consented test images.
             candidate = matches[0] if matches and matches[0]["similarity"] >= 0.45 else None
 
-            if candidate:
-                st.markdown("**Possible saved profile**")
-                st.write(f"Name: {candidate['name']}")
-                if candidate["description"]:
-                    st.write(f"Description: {candidate['description']}")
-                if candidate["notes"]:
-                    st.write(f"Notes: {candidate['notes']}")
-                st.caption(
-                    f"Similarity score: {candidate['similarity']:.3f}. "
-                    "This score is model-specific and must not be treated as a probability. Confirm the match before linking this sample."
-                )
-            elif matches:
-                st.info("No strong candidate reached the initial matching threshold. You can review the closest candidates below.")
-                for match in matches[:3]:
-                    st.write(f"{match['name']} — similarity {match['similarity']:.3f}")
-            else:
-                st.info("No saved face profiles yet. Create a profile below to start your private gallery.")
+            # Candidate profile details are intentionally hidden in this section.
+            # They are shown only inside AI Explanation after the user requests it.
 
-            with st.expander("Create a new face profile", expanded=not bool(candidate)):
+            if profiles:
+                st.markdown("**Manage existing profiles**")
+                profile_by_id = {profile["id"]: profile for profile in profiles}
+                selected_profile_id = st.selectbox(
+                    "Choose existing profile",
+                    list(profile_by_id.keys()),
+                    format_func=lambda profile_id: profile_by_id[profile_id]["name"],
+                    key="profile_sample_target",
+                )
+                selected_profile = profile_by_id[selected_profile_id]
+
+                with st.expander("Update / Delete existing profile", expanded=True):
+                    st.caption(
+                        "After confirming this is the same person, the new face sample is added and new information is appended. "
+                        "Existing notes are preserved unless you explicitly change the name."
+                    )
+                    with st.form("update_existing_profile_form"):
+                        updated_name = st.text_input(
+                            "Update name (optional; leave blank to keep current name)",
+                            value=selected_profile["name"],
+                            max_chars=100,
+                        )
+                        description_addition = st.text_area(
+                            "New description to add (optional)",
+                            placeholder="Add new information; existing description will be preserved.",
+                            max_chars=1000,
+                        )
+                        notes_addition = st.text_area(
+                            "New notes to append (optional)",
+                            placeholder="Add new notes; existing notes will be preserved.",
+                            max_chars=3000,
+                        )
+                        confirm_link = st.checkbox(
+                            "I reviewed the candidate and confirm this sample belongs to the selected profile.",
+                            key="confirm_profile_link",
+                        )
+                        update_profile_submitted = st.form_submit_button(
+                            "Confirm same person & update existing profile"
+                        )
+
+                    if update_profile_submitted:
+                        if not confirm_link:
+                            st.error("Please confirm the same-person match before updating the profile.")
+                        else:
+                            try:
+                                final_name = update_face_profile_info(
+                                    db_engine,
+                                    selected_profile_id,
+                                    new_name=updated_name,
+                                    description_addition=description_addition,
+                                    notes_addition=notes_addition,
+                                )
+                                add_face_profile_sample(
+                                    db_engine, selected_profile_id, selected_identity["embedding"]
+                                )
+                                record_profile_review(db_engine, selected_profile_id, current_image_fingerprint)
+                                st.session_state["confirmed_profile_id_for_current_image"] = int(selected_profile_id)
+                                st.session_state["confirmed_profile_image_fingerprint"] = current_image_fingerprint
+                                st.session_state["confirmed_profile_face_index"] = matched_measurement_index
+                                st.session_state["confirmed_profile_identity_index"] = identity_index
+                                if matched_measurement_index is None:
+                                    st.warning(
+                                        "Profile information and face sample were updated, but the measurement detector "
+                                        "could not confidently map this face to a row. The measurement record will not be linked until it can be mapped."
+                                    )
+                                else:
+                                    st.success(
+                                        f"Profile '{final_name}' updated. New sample added; new description/notes were appended. "
+                                        "Click 'Save analysis to database' to link the measurement record."
+                                    )
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"Could not update face profile: {exc}")
+
+                    st.divider()
+                    st.markdown("**Delete this profile**")
+                    st.caption(
+                        "Deletion permanently removes the selected profile and its stored embeddings. "
+                        "Historical measurement rows are retained but become unlinked."
+                    )
+                    confirm_delete = st.checkbox(
+                        f"I understand that '{selected_profile['name']}' and its saved face samples will be deleted.",
+                        key=f"confirm_delete_profile_{selected_profile_id}",
+                    )
+                    if st.button("Delete selected face profile", key="delete_face_profile"):
+                        if not confirm_delete:
+                            st.error("Confirm deletion first.")
+                        else:
+                            try:
+                                delete_face_profile(db_engine, selected_profile_id)
+                                st.session_state.pop("confirmed_profile_id_for_current_image", None)
+                                st.session_state.pop("confirmed_profile_face_index", None)
+                                st.session_state.pop("confirmed_profile_identity_index", None)
+                                st.session_state.pop("confirmed_profile_image_fingerprint", None)
+                                st.success("Face profile deleted.")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"Could not delete face profile: {exc}")
+
+                    st.markdown("**Export this profile's accumulated analysis CSV**")
+                    profile_rows = load_profile_analyses(db_engine, selected_profile_id)
+                    if not profile_rows.empty:
+                        st.download_button(
+                            "Download selected profile CSV",
+                            data=profile_rows.to_csv(index=False).encode("utf-8-sig"),
+                            file_name=f"face_profile_{selected_profile_id}_analysis.csv",
+                            mime="text/csv",
+                            key="download_profile_csv",
+                        )
+                    else:
+                        st.caption(
+                            "No analysis records have been linked to this profile yet. Confirm a face sample, "
+                            "then click 'Save analysis to database'."
+                        )
+
+            # New profile creation is intentionally placed below the update/delete controls.
+            with st.expander("Create a new face profile", expanded=False):
                 with st.form("create_face_profile_form"):
                     new_name = st.text_input("Name (required)", max_chars=100)
                     new_description = st.text_area("Description", max_chars=1000)
@@ -977,103 +1106,6 @@ if uploaded_file is not None and db_engine is not None:
                         except Exception as exc:
                             st.error(f"Could not save face profile: {exc}")
 
-            if profiles:
-                st.markdown("**Manage existing profiles**")
-                profile_by_id = {profile["id"]: profile for profile in profiles}
-                selected_profile_id = st.selectbox(
-                    "Choose existing profile for this face",
-                    list(profile_by_id.keys()),
-                    format_func=lambda profile_id: profile_by_id[profile_id]["name"],
-                    key="profile_sample_target",
-                )
-                selected_profile = profile_by_id[selected_profile_id]
-                st.caption("After you confirm this is the same person, the new face sample is added and new information is appended to the existing profile. Existing notes are preserved.")
-                with st.form("update_existing_profile_form"):
-                    updated_name = st.text_input(
-                        "Update name (optional; leave blank to keep current name)",
-                        value=selected_profile["name"],
-                        max_chars=100,
-                    )
-                    description_addition = st.text_area(
-                        "New description to add (optional)",
-                        placeholder="Add new information; existing description will be preserved.",
-                        max_chars=1000,
-                    )
-                    notes_addition = st.text_area(
-                        "New notes to append (optional)",
-                        placeholder="Add new notes; existing notes will be preserved.",
-                        max_chars=3000,
-                    )
-                    confirm_link = st.checkbox(
-                        "I reviewed the candidate and confirm this sample belongs to the selected profile.",
-                        key="confirm_profile_link",
-                    )
-                    update_profile_submitted = st.form_submit_button(
-                        "Confirm same person & update existing profile"
-                    )
-
-                if update_profile_submitted:
-                    if not confirm_link:
-                        st.error("Please confirm the same-person match before updating the profile.")
-                    else:
-                        try:
-                            final_name = update_face_profile_info(
-                                db_engine,
-                                selected_profile_id,
-                                new_name=updated_name,
-                                description_addition=description_addition,
-                                notes_addition=notes_addition,
-                            )
-                            add_face_profile_sample(
-                                db_engine, selected_profile_id, selected_identity["embedding"]
-                            )
-                            record_profile_review(db_engine, selected_profile_id, current_image_fingerprint)
-                            st.session_state["confirmed_profile_id_for_current_image"] = int(selected_profile_id)
-                            st.session_state["confirmed_profile_image_fingerprint"] = current_image_fingerprint
-                            st.session_state["confirmed_profile_face_index"] = matched_measurement_index
-                            st.session_state["confirmed_profile_identity_index"] = identity_index
-                            if matched_measurement_index is None:
-                                st.warning("Profile information and face sample were updated, but the measurement detector could not confidently map this face to a row. The measurement record will not be linked until it can be mapped.")
-                            else:
-                                st.success(f"Profile '{final_name}' updated. New sample added; new description/notes were appended without deleting existing information. Click 'Save analysis to database' to link the measurement record.")
-                            st.rerun()
-                        except Exception as exc:
-                            st.error(f"Could not update face profile: {exc}")
-
-                st.markdown("**Export this profile's accumulated analysis CSV**")
-                profile_rows = load_profile_analyses(db_engine, selected_profile_id)
-                if not profile_rows.empty:
-                    st.download_button(
-                        "Download selected profile CSV",
-                        data=profile_rows.to_csv(index=False).encode("utf-8-sig"),
-                        file_name=f"face_profile_{selected_profile_id}_analysis.csv",
-                        mime="text/csv",
-                        key="download_profile_csv",
-                    )
-                else:
-                    st.caption("No analysis records have been linked to this profile yet. Confirm a face sample, then click 'Save analysis to database'.")
-
-                st.markdown("**Delete a profile**")
-                delete_profile_id = st.selectbox(
-                    "Choose profile to delete",
-                    list(profile_by_id.keys()),
-                    format_func=lambda profile_id: profile_by_id[profile_id]["name"],
-                    key="delete_profile_target",
-                )
-                confirm_delete = st.checkbox(
-                    "I understand this permanently deletes the selected profile and its saved embeddings.",
-                    key="confirm_delete_profile",
-                )
-                if st.button("Delete selected face profile", key="delete_face_profile"):
-                    if not confirm_delete:
-                        st.error("Confirm deletion first.")
-                    else:
-                        try:
-                            delete_face_profile(db_engine, delete_profile_id)
-                            st.success("Face profile deleted.")
-                            st.rerun()
-                        except Exception as exc:
-                            st.error(f"Could not delete face profile: {exc}")
     except Exception as exc:
         st.warning(
             "Face profile matching is unavailable. Confirm that insightface and onnxruntime "
