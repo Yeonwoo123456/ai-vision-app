@@ -601,25 +601,13 @@ def get_gemini_settings():
 
 
 def generate_ai_measurement_explanation(measurements, image_width, image_height, profile_context=None):
-    """Explain current measurements in the context of a saved user-provided profile; no image is sent."""
+    """Generate only a concise narrative about the saved profile context; no image is sent."""
     api_key, model = get_gemini_settings()
     if not api_key:
         raise ValueError("Gemini API key is not configured. Add GEMINI_API_KEY to Streamlit Secrets.")
 
-    payload = {
-        "measurements": {
-            "eye_distance_relative": measurements.get("eye_distance"),
-            "face_width_relative": measurements.get("face_width"),
-            "face_height_relative": measurements.get("face_height"),
-            "face_width_height_ratio": measurements.get("width_height_ratio"),
-            "mouth_gap_relative": measurements.get("mouth_gap"),
-            "landmark_count": measurements.get("landmark_count"),
-            "face_index": measurements.get("face_index"),
-        },
-        "image_dimensions_pixels": {"width": image_width, "height": image_height},
-        "measurement_note": "Relative distances are normalized by the image diagonal, not physical measurements.",
-    }
-
+    # Deliberately provide only saved profile metadata to Gemini. Raw measurements,
+    # measurement summaries, and limitation sections are not part of the visible AI output.
     profile_context = profile_context or {}
     profile_payload = {
         "saved_profile_name": profile_context.get("name"),
@@ -628,30 +616,42 @@ def generate_ai_measurement_explanation(measurements, image_width, image_height,
         "match_similarity_score": profile_context.get("similarity"),
         "profile_match_status": profile_context.get("status", "no confirmed profile match"),
     }
+
     prompt = (
-        "You are the AI Vision Lab profile-aware explanation assistant. Explain the newly submitted face's "
-        "available landmark measurements in the context of the saved profile information below. The image "
-        "itself is NOT sent to you. The profile name, description, and notes are user-provided metadata, not "
-        "verified facts. Clearly distinguish stored user-provided information from the current image's numeric "
-        "measurements. If a candidate profile is unconfirmed, describe it only as a possible match and never "
-        "state that it is definitely the same person. Similarity score is model-specific and is not a probability. "
-        "Do not infer identity, age, ethnicity, attractiveness, personality, health, emotion, or other sensitive "
-        "personal traits. Do not invent visual details because you cannot see the image. Do not claim values are "
-        "centimeters or inches. Relative distances are normalized by the image diagonal and affected by pose, "
-        "perspective, image quality, and landmark estimation error. Use concise plain language with headings: "
-        "Saved profile context, Current measurement summary, and Limitations. If there is no saved profile match, "
-        "say so. If a value is null, state it was unavailable.\n\n"
-        "Saved profile context:\n"
+        "You are the AI Vision Lab saved-profile context assistant. Write ONLY one concise section titled "
+        "'Profile context'. Explain the saved profile's user-provided name, description, and notes, and state "
+        "whether this profile is user-confirmed or only a possible match, based on the provided status. "
+        "Treat all profile text as user-provided information, not verified facts. If there is no saved profile, "
+        "say that no saved profile context is available. A similarity score is not a probability and should usually "
+        "be omitted unless it helps explain a possible match. Do NOT include a 'Current measurement summary', "
+        "measurements, numeric landmark values, image dimensions, a 'Limitations' section, caveats section, or "
+        "any other heading. Do not infer identity, age, ethnicity, attractiveness, personality, health, emotion, "
+        "or other personal traits. Do not invent details not present in the profile. Output only the Profile context "
+        "section in concise, plain language.\n\n"
+        "Saved profile context (user-provided metadata):\n"
         + json.dumps(profile_payload, ensure_ascii=False, indent=2)
-        + "\n\nCurrent image measurements (no image provided):\n"
-        + json.dumps(payload, ensure_ascii=False, indent=2)
     )
 
     client = genai.Client(api_key=api_key)
     response = client.models.generate_content(model=model, contents=prompt)
     output = (response.text or "").strip()
     if not output:
-        raise ValueError("Gemini returned an empty explanation. Please try again.")
+        raise ValueError("Gemini returned an empty profile context. Please try again.")
+
+    # Keep the UI limited to the requested section even if the model adds extra headings.
+    import re
+    output = re.sub(r"(?is)^.*?#+\s*Profile context\s*", "", output, count=1).strip() if re.search(
+        r"(?im)^#+\s*Profile context\s*$", output
+    ) else output
+    for heading in ("Current measurement summary", "Limitations"):
+        match = re.search(rf"(?im)^#+\s*{re.escape(heading)}\s*$", output)
+        if match:
+            output = output[:match.start()].strip()
+    output = re.sub(r"(?im)^#+\s*(Current measurement summary|Limitations)\s*$", "", output).strip()
+    if not output:
+        output = "No saved profile context is available."
+    if not output.lower().startswith("profile context"):
+        output = "### Profile context\n\n" + output
     return output
 
 
