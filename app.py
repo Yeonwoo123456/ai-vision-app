@@ -139,8 +139,14 @@ def show_image(image, caption):
     )
 
 
-def distance(p1, p2):
-    return float(np.hypot(p1["x"] - p2["x"], p1["y"] - p2["y"]))
+def distance(p1, p2, image_width=1, image_height=1):
+    """Return distance normalized by the image diagonal, accounting for aspect ratio."""
+    dx = (p1["x"] - p2["x"]) * image_width
+    dy = (p1["y"] - p2["y"]) * image_height
+    diagonal = float(np.hypot(image_width, image_height))
+    if diagonal <= 0:
+        return None
+    return float(np.hypot(dx, dy) / diagonal)
 
 
 def center(landmarks, indices):
@@ -156,7 +162,7 @@ def center(landmarks, indices):
     }
 
 
-def analyze_face(face):
+def analyze_face(face, image_width=1, image_height=1):
     points = face["landmarks"]
 
     def point(index):
@@ -173,13 +179,13 @@ def analyze_face(face):
     lower_lip = point(14)
 
     eye_distance = (
-        distance(left_eye, right_eye)
+        distance(left_eye, right_eye, image_width, image_height)
         if left_eye and right_eye else None
     )
-    face_width = distance(left, right) if left and right else None
-    face_height = distance(top, bottom) if top and bottom else None
+    face_width = distance(left, right, image_width, image_height) if left and right else None
+    face_height = distance(top, bottom, image_width, image_height) if top and bottom else None
     mouth_gap = (
-        distance(upper_lip, lower_lip)
+        distance(upper_lip, lower_lip, image_width, image_height)
         if upper_lip and lower_lip else None
     )
 
@@ -200,6 +206,109 @@ def analyze_face(face):
         "width_height_ratio": ratio,
         "mouth_gap": mouth_gap,
     }
+
+
+
+def draw_measurement_overlay(image, face):
+    """Draw color-coded facial regions and measurement guides on an RGB image."""
+    image = validate_image(image).copy()
+    height, width = image.shape[:2]
+    points = face.get("landmarks", [])
+
+    from PIL import ImageDraw, ImageFont
+
+    canvas = Image.fromarray(image)
+    draw = ImageDraw.Draw(canvas)
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+
+    def xy(index):
+        if index < 0 or index >= len(points):
+            return None
+        point = points[index]
+        try:
+            x = int(round(float(point["x"]) * width))
+            y = int(round(float(point["y"]) * height))
+        except (KeyError, TypeError, ValueError):
+            return None
+        return (max(0, min(width - 1, x)), max(0, min(height - 1, y)))
+
+    def draw_chain(indices, color, line_width=None, closed=False):
+        coords = [xy(i) for i in indices]
+        coords = [pt for pt in coords if pt is not None]
+        if len(coords) >= 2:
+            if closed:
+                coords.append(coords[0])
+            draw.line(coords, fill=color, width=line_width or max(2, width // 500), joint="curve")
+
+    def draw_points(indices, color, radius=None):
+        radius = radius or max(2, width // 250)
+        for index in indices:
+            pt = xy(index)
+            if pt is not None:
+                x, y = pt
+                draw.ellipse((x-radius, y-radius, x+radius, y+radius), fill=color, outline=(255, 255, 255), width=1)
+
+    # MediaPipe Face Mesh contours: distinct colors for the main facial regions.
+    face_oval = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
+                 397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
+                 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109]
+    left_eye = [33, 160, 158, 133, 153, 144]
+    right_eye = [362, 385, 387, 263, 373, 380]
+    left_brow = [70, 63, 105, 66, 107]
+    right_brow = [336, 296, 334, 293, 300]
+    outer_lips = [61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291,
+                  375, 321, 405, 314, 17, 84, 181, 91, 146, 61]
+    inner_lips = [78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308,
+                  324, 318, 402, 317, 14, 87, 178, 88, 95, 78]
+    nose_bridge = [168, 6, 197, 195, 5, 4]
+    nose_base = [98, 97, 2, 326, 327]
+
+    draw_chain(face_oval, (255, 210, 40), closed=True)
+    draw_chain(left_eye, (50, 150, 255), closed=True)
+    draw_chain(right_eye, (50, 150, 255), closed=True)
+    draw_chain(left_brow, (170, 100, 255))
+    draw_chain(right_brow, (170, 100, 255))
+    draw_chain(outer_lips, (255, 70, 100))
+    draw_chain(inner_lips, (255, 70, 100))
+    draw_chain(nose_bridge, (40, 220, 220))
+    draw_chain(nose_base, (40, 220, 220))
+    draw_points([33, 133, 362, 263], (50, 150, 255))
+    draw_points([234, 454, 10, 152, 13, 14], (255, 210, 40))
+
+    def group_center(indices):
+        coords = [xy(i) for i in indices]
+        coords = [pt for pt in coords if pt is not None]
+        if not coords:
+            return None
+        return (int(sum(pt[0] for pt in coords) / len(coords)),
+                int(sum(pt[1] for pt in coords) / len(coords)))
+
+    measurements = [
+        (group_center([33, 133, 159, 145]), group_center([362, 263, 386, 374]), "Eye distance", (40, 130, 255)),
+        (xy(234), xy(454), "Face width", (30, 180, 80)),
+        (xy(10), xy(152), "Face height", (255, 145, 0)),
+        (xy(13), xy(14), "Mouth opening", (220, 50, 80)),
+    ]
+
+    line_width = max(2, width // 400)
+    radius = max(3, width // 180)
+    for start, end, label, color in measurements:
+        if start is None or end is None:
+            continue
+        draw.line([start, end], fill=color, width=line_width)
+        for x, y in (start, end):
+            draw.ellipse((x-radius, y-radius, x+radius, y+radius), fill=color, outline="white", width=1)
+        midpoint = ((start[0] + end[0]) // 2, (start[1] + end[1]) // 2)
+        if font:
+            box = draw.textbbox(midpoint, label, font=font, anchor="mm")
+            pad = 3
+            draw.rounded_rectangle((box[0]-pad, box[1]-pad, box[2]+pad, box[3]+pad), radius=3, fill=(20, 20, 20))
+            draw.text(midpoint, label, fill="white", font=font, anchor="mm")
+
+    return np.asarray(canvas)
 
 
 def pct(value):
@@ -225,6 +334,11 @@ with st.sidebar:
     show_coordinates = st.checkbox(
         "Show landmark coordinates",
         value=False,
+    )
+
+    show_measurements = st.checkbox(
+        "Show measurement lines on image",
+        value=True,
     )
 
 
@@ -270,7 +384,7 @@ if uploaded_file is not None:
         st.error(f"Image processing failed: {exc}")
         st.stop()
 
-    analyses = [analyze_face(face) for face in faces]
+    analyses = [analyze_face(face, original.shape[1], original.shape[0]) for face in faces]
 
     st.subheader("Analysis Overview")
 
@@ -283,6 +397,10 @@ if uploaded_file is not None:
     c3.metric("Width", f"{original.shape[1]} px")
     c4.metric("Height", f"{original.shape[0]} px")
 
+    if show_landmarks and show_measurements and faces:
+        for detected_face in faces:
+            annotated = draw_measurement_overlay(annotated, detected_face)
+
     left_col, right_col = st.columns(2)
 
     with left_col:
@@ -290,7 +408,7 @@ if uploaded_file is not None:
 
     with right_col:
         if show_landmarks:
-            show_image(annotated, "Landmark visualization")
+            show_image(annotated, "Landmark visualization and measurements" if show_measurements else "Landmark visualization")
 
     if not faces:
         st.warning("No face was detected.")
