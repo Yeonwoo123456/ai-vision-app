@@ -602,14 +602,17 @@ def get_gemini_settings():
 
 
 def generate_ai_measurement_explanation(measurements, image_width, image_height, profile_context=None):
-    """Generate only a concise narrative about the saved profile context; no image is sent."""
+    """Show saved-profile context only; do not call Gemini when no profile matches."""
+    profile_context = profile_context or {}
+    if profile_context.get("no_match") or profile_context.get("status") == "no saved profile match":
+        return "No profile matching this person was found. If you would like, please create a new profile."
+
     api_key, model = get_gemini_settings()
     if not api_key:
         raise ValueError("Gemini API key is not configured. Add GEMINI_API_KEY to Streamlit Secrets.")
 
     # Deliberately provide only saved profile metadata to Gemini. Raw measurements,
     # measurement summaries, and limitation sections are not part of the visible AI output.
-    profile_context = profile_context or {}
     profile_payload = {
         "saved_profile_name": profile_context.get("name"),
         "user_provided_description": profile_context.get("description", ""),
@@ -788,7 +791,7 @@ if uploaded_file is not None:
         if st.button("Generate AI explanation", key="generate_ai_measurement_explanation"):
             try:
                 with st.spinner("Generating profile-aware explanation with Gemini..."):
-                    profile_context = {}
+                    profile_context = {"no_match": True, "status": "no saved profile match"}
                     if db_engine is not None:
                         identity_faces_for_ai = get_identity_faces(original)
                         saved_profiles_for_ai = load_face_profiles(db_engine)
@@ -840,6 +843,10 @@ if uploaded_file is not None:
                                             "similarity": top_profile["similarity"],
                                             "status": "possible match; not user-confirmed for this image",
                                         }
+                                    else:
+                                        profile_context = {"no_match": True, "status": "no saved profile match"}
+                                else:
+                                    profile_context = {"no_match": True, "status": "no saved profile match"}
                     explanation = generate_ai_measurement_explanation(
                         selected, original.shape[1], original.shape[0], profile_context
                     )
