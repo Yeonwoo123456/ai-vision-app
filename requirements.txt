@@ -6,4 +6,4 @@ pillow
 pandas
 sqlalchemy
 psycopg[binary]
-openai
+google-genai
