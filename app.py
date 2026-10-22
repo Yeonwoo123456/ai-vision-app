@@ -2,7 +2,6 @@ import hashlib
 import io
 import json
 import os
-import time
 from datetime import datetime, timezone
 
 import numpy as np
@@ -10,7 +9,6 @@ import pandas as pd
 import streamlit as st
 from PIL import Image, ImageOps
 from sqlalchemy import create_engine, text
-from google import genai
 from detector import detect_faces
 from ui import configure_page, render_header, render_sidebar, show_image
 
@@ -649,95 +647,46 @@ def draw_measurement_overlay(image, face):
 def pct(value):
     return f"{value * 100:.2f}%" if value is not None else "N/A"
 
-def get_gemini_settings():
-    try:
-        api_key = st.secrets.get("GEMINI_API_KEY", "")
-        model = st.secrets.get("GEMINI_MODEL", "gemini-2.5-flash")
-    except Exception:
-        api_key = ""
-        model = "gemini-2.5-flash"
-
-    if not api_key:
-        api_key = os.environ.get("GEMINI_API_KEY", "")
-    if not model:
-        model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-    return api_key, model
-
 def generate_ai_measurement_explanation(measurements, image_width, image_height, profile_context=None):
+    """Format saved profile fields locally without making a Gemini API request.
+
+    This section only presents metadata already stored in the database, so an LLM
+    call adds latency and can fail during provider overload without adding value.
+    """
     profile_context = profile_context or {}
     if profile_context.get("no_match") or profile_context.get("status") == "no saved profile match":
         return "No profile matching this person was found. If you would like, please create a new profile."
 
-    api_key, model = get_gemini_settings()
-    if not api_key:
-        raise ValueError("Gemini API key is not configured. Add GEMINI_API_KEY to Streamlit Secrets.")
+    name = str(profile_context.get("name") or "Not available").strip()
+    description = str(profile_context.get("description") or "Not available").strip()
+    note = str(profile_context.get("notes") or "Not available").strip()
+    similarity = profile_context.get("similarity")
+    status = str(profile_context.get("status", "no confirmed profile match"))
 
-    profile_payload = {
-        "saved_profile_name": profile_context.get("name"),
-        "user_provided_description": profile_context.get("description", ""),
-        "user_provided_notes": profile_context.get("notes", ""),
-        "match_similarity_score": profile_context.get("similarity"),
-        "profile_match_status": profile_context.get("status", "no confirmed profile match"),
-    }
-
-    prompt = (
-        "You are the AI Vision Lab saved-profile context formatter. Output exactly these four lines and nothing else, "
-        "with no heading, paragraph, bullets, markdown, or extra explanation:\n"
-        "Name: <saved profile name or Not available>\n"
-        "Description: <user-provided description or Not available>\n"
-        "Note: <user-provided notes or Not available>\n"
-        "Similarity: <model-specific score and match status, or Not available>\n\n"
-        "For a possible match, format Similarity as '<score> (model-specific score, not a probability; confirm before linking)'. "
-        "For a user-confirmed match, format Similarity as '<score if available> (user-confirmed)' or 'User-confirmed; score not available'. "
-        "If no profile is available, use 'Not available' for Name, Description, and Note, and 'No saved profile match' for Similarity. "
-        "Treat all profile text as user-provided information, not verified facts. Preserve the user's wording and do not invent details. "
-        "Do not include measurement summaries, landmark values, image dimensions, limitations, or any other content. "
-        "Do not infer identity or personal traits beyond the provided fields.\n\n"
-        "Saved profile context (user-provided metadata):\n"
-        + json.dumps(profile_payload, ensure_ascii=False, indent=2)
-    )
-
-    client = genai.Client(api_key=api_key)
-    response = None
-    last_error = None
-                                                                              
-    for attempt in range(3):
-        try:
-            response = client.models.generate_content(model=model, contents=prompt)
-            last_error = None
-            break
-        except Exception as exc:
-            last_error = exc
-            error_text = str(exc).upper()
-            is_temporary = any(token in error_text for token in ("503", "UNAVAILABLE", "502", "504", "INTERNAL SERVER ERROR"))
-            if not is_temporary or attempt == 2:
-                raise
-            time.sleep(1.5 * (2 ** attempt))
-    if last_error is not None or response is None:
-        raise RuntimeError(f"Gemini temporarily unavailable after retries: {last_error}")
-    output = (response.text or "").strip()
-    if not output:
-        raise ValueError("Gemini returned an empty profile context. Please try again.")
-
-    import re
-    output = re.sub(r"(?im)^#+\s*Profile context\s*$", "", output).strip()
-    field_values = {}
-    for field in ("Name", "Description", "Note", "Similarity"):
-        match = re.search(rf"(?im)^\s*{field}\s*:\s*(.*?)\s*$", output)
-        field_values[field] = match.group(1).strip() if match else "Not available"
-    if field_values["Similarity"] == "Not available" and profile_payload.get("match_similarity_score") is not None:
-        score = profile_payload["match_similarity_score"]
-        status = str(profile_payload.get("profile_match_status", ""))
-        if "possible" in status.lower():
-            field_values["Similarity"] = f"{score:.3f} (model-specific score, not a probability; confirm before linking)"
+    if similarity is None:
+        if "user-confirmed" in status.lower() or "user confirmed" in status.lower():
+            similarity_text = "User-confirmed; score not available"
+        elif "possible" in status.lower():
+            similarity_text = "Not available (possible match; confirm before linking)"
         else:
-            field_values["Similarity"] = f"{score:.3f} (user-confirmed)"
-    if "possible" in str(profile_payload.get("profile_match_status", "")).lower():
-        if field_values["Similarity"] == "Not available":
-            field_values["Similarity"] = "Not available (possible match; confirm before linking)"
-        elif "confirm before linking" not in field_values["Similarity"].lower():
-            field_values["Similarity"] += "; confirm before linking"
-    return "\n\n".join(f"**{field}:** {field_values[field]}" for field in ("Name", "Description", "Note", "Similarity"))
+            similarity_text = "Not available"
+    else:
+        try:
+            score_text = f"{float(similarity):.3f}"
+        except (TypeError, ValueError):
+            score_text = str(similarity).strip()
+        if "possible" in status.lower():
+            similarity_text = f"{score_text} (model-specific score, not a probability; confirm before linking)"
+        else:
+            similarity_text = f"{score_text} (user-confirmed)"
+
+    fields = {
+        "Name": name,
+        "Description": description,
+        "Note": note,
+        "Similarity": similarity_text,
+    }
+    return "\n\n".join(f"**{field}:** {value}" for field, value in fields.items())
 
 render_header()
 source, show_landmarks, show_coordinates, show_measurements = render_sidebar()
@@ -884,19 +833,7 @@ if uploaded_file is not None:
                 st.session_state["ai_measurement_explanation"] = explanation
                 st.session_state["ai_measurement_explanation_face"] = selected_index
             except Exception as exc:
-                error_text = str(exc)
-                if "503" in error_text or "UNAVAILABLE" in error_text.upper():
-                    st.error(
-                        "Gemini is temporarily busy (503 UNAVAILABLE). The app retried automatically, "
-                        "but the model is still unavailable. Wait a little and try again, or select another "
-                        "model available to your API key in Streamlit Secrets (GEMINI_MODEL). "
-                        f"Details: {exc}"
-                    )
-                else:
-                    st.error(
-                        "Could not generate the AI explanation. Check GEMINI_API_KEY in Streamlit Secrets, "
-                        f"model access, and API limits. Details: {exc}"
-                    )
+                st.error(f"Could not format the saved profile information: {exc}")
 
         if (
             st.session_state.get("ai_measurement_explanation")
