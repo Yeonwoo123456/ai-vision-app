@@ -1,4 +1,3 @@
-import base64
 import hashlib
 import io
 import json
@@ -13,12 +12,10 @@ from PIL import Image, ImageOps
 from sqlalchemy import create_engine, text
 from google import genai
 from detector import detect_faces
+from ui import configure_page, render_header, render_sidebar, show_image
 
 
-st.set_page_config(
-    page_title="AI Vision Lab",
-    layout="wide",
-)
+configure_page()
 
 
 
@@ -69,6 +66,9 @@ def initialize_database(engine):
         """))
         # Safe migration for existing Neon databases created before profile linking.
         connection.execute(text("ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS profile_id BIGINT NULL"))
+        # Idempotency key: the same uploaded image/face should not create duplicate history rows.
+        connection.execute(text("ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS image_fingerprint TEXT NULL"))
+        connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_analysis_image_face ON analysis_history (image_fingerprint, face_index) WHERE image_fingerprint IS NOT NULL"))
         # Identity profiles are separate from measurement history. Only embeddings and
         # user-entered profile text are stored; source images are not persisted.
         connection.execute(text("""
@@ -90,9 +90,14 @@ def initialize_database(engine):
                 id BIGSERIAL PRIMARY KEY,
                 profile_id BIGINT NOT NULL REFERENCES face_profiles(id) ON DELETE CASCADE,
                 embedding TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                sample_fingerprint TEXT NULL,
+                sample_face_index INTEGER NULL
             )
         """))
+        connection.execute(text("ALTER TABLE face_profile_embeddings ADD COLUMN IF NOT EXISTS sample_fingerprint TEXT NULL"))
+        connection.execute(text("ALTER TABLE face_profile_embeddings ADD COLUMN IF NOT EXISTS sample_face_index INTEGER NULL"))
+        connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_profile_sample_fingerprint ON face_profile_embeddings (profile_id, sample_fingerprint, sample_face_index) WHERE sample_fingerprint IS NOT NULL AND sample_face_index IS NOT NULL"))
         connection.execute(text("""
             CREATE TABLE IF NOT EXISTS face_match_reviews (
                 id BIGSERIAL PRIMARY KEY,
@@ -107,9 +112,20 @@ def initialize_database(engine):
         # Safe migration for review records created by earlier app versions.
         connection.execute(text("ALTER TABLE face_match_reviews ADD COLUMN IF NOT EXISTS similarity_score DOUBLE PRECISION NULL"))
         connection.execute(text("ALTER TABLE face_match_reviews ADD COLUMN IF NOT EXISTS candidate_rank INTEGER NULL"))
+        # Remove duplicate historical review events before enforcing idempotency going forward.
+        connection.execute(text("""
+            DELETE FROM face_match_reviews older
+            USING face_match_reviews newer
+            WHERE older.profile_id = newer.profile_id
+              AND older.image_fingerprint = newer.image_fingerprint
+              AND older.decision = newer.decision
+              AND older.id < newer.id
+        """))
+        connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_profile_review_event ON face_match_reviews (profile_id, image_fingerprint, decision)"))
 
 
-def save_analysis(engine, face_count, width, height, result, profile_id=None):
+def save_analysis(engine, face_count, width, height, result, profile_id=None, image_fingerprint=None):
+    """Idempotently save a face analysis; repeated clicks do not duplicate the same image/face."""
     created_at = datetime.now(timezone.utc).isoformat()
     with engine.begin() as connection:
         connection.execute(
@@ -117,20 +133,24 @@ def save_analysis(engine, face_count, width, height, result, profile_id=None):
                 INSERT INTO analysis_history (
                     created_at, face_count, image_width, image_height,
                     face_index, landmark_count, eye_distance, face_width,
-                    face_height, width_height_ratio, mouth_gap, profile_id
+                    face_height, width_height_ratio, mouth_gap, profile_id, image_fingerprint
                 ) VALUES (
                     :created_at, :face_count, :image_width, :image_height,
                     :face_index, :landmark_count, :eye_distance, :face_width,
-                    :face_height, :width_height_ratio, :mouth_gap, :profile_id
+                    :face_height, :width_height_ratio, :mouth_gap, :profile_id, :image_fingerprint
                 )
+                ON CONFLICT (image_fingerprint, face_index) WHERE image_fingerprint IS NOT NULL
+                DO UPDATE SET
+                    profile_id = COALESCE(EXCLUDED.profile_id, analysis_history.profile_id)
             """),
             {
                 "created_at": created_at,
-                "face_count": face_count,
-                "image_width": width,
-                "image_height": height,
+                "face_count": int(face_count),
+                "image_width": int(width),
+                "image_height": int(height),
                 **result,
-                "profile_id": profile_id,
+                "profile_id": int(profile_id) if profile_id is not None else None,
+                "image_fingerprint": image_fingerprint,
             },
         )
 
@@ -300,18 +320,28 @@ def load_face_profiles(engine):
             }
         if row["embedding"]:
             try:
-                profiles[profile_id]["embeddings"].append(
-                    np.asarray(json.loads(row["embedding"]), dtype=np.float32)
-                )
+                vector = normalize_embedding(json.loads(row["embedding"]))
+                profiles[profile_id]["embeddings"].append(vector)
             except (ValueError, TypeError, json.JSONDecodeError):
+                # Ignore malformed legacy samples rather than breaking all profile matching.
                 continue
     return list(profiles.values())
 
 
-def create_face_profile(engine, name, description, notes, embedding):
+def normalize_embedding(embedding):
+    """Validate and L2-normalize an embedding before storing or comparing it."""
+    vector = np.asarray(embedding, dtype=np.float32).reshape(-1)
+    if vector.size == 0 or not np.all(np.isfinite(vector)):
+        raise ValueError("The face model returned an invalid embedding. Please retry with another image.")
+    norm = float(np.linalg.norm(vector))
+    if not np.isfinite(norm) or norm <= 1e-12:
+        raise ValueError("The face model returned an empty embedding. Please retry with another image.")
+    return vector / norm
+
+
+def create_face_profile(engine, name, description, notes, embedding, sample_fingerprint=None, sample_face_index=None):
     now = datetime.now(timezone.utc).isoformat()
-    normalized = np.asarray(embedding, dtype=np.float32)
-    normalized = normalized / max(float(np.linalg.norm(normalized)), 1e-12)
+    normalized = normalize_embedding(embedding)
     with engine.begin() as connection:
         profile_id = connection.execute(text("""
             INSERT INTO face_profiles (alias, name, description, notes, created_at, updated_at)
@@ -322,32 +352,49 @@ def create_face_profile(engine, name, description, notes, embedding):
             "created_at": now, "updated_at": now,
         }).scalar_one()
         connection.execute(text("""
-            INSERT INTO face_profile_embeddings (profile_id, embedding, created_at)
-            VALUES (:profile_id, :embedding, :created_at)
+            INSERT INTO face_profile_embeddings (
+                profile_id, embedding, created_at, sample_fingerprint, sample_face_index
+            ) VALUES (
+                :profile_id, :embedding, :created_at, :sample_fingerprint, :sample_face_index
+            )
+            ON CONFLICT (profile_id, sample_fingerprint, sample_face_index)
+            WHERE sample_fingerprint IS NOT NULL AND sample_face_index IS NOT NULL
+            DO NOTHING
         """), {
             "profile_id": profile_id,
             "embedding": json.dumps(normalized.tolist()),
             "created_at": now,
+            "sample_fingerprint": sample_fingerprint,
+            "sample_face_index": sample_face_index,
         })
     return profile_id
 
 
-def add_face_profile_sample(engine, profile_id, embedding):
+def add_face_profile_sample(engine, profile_id, embedding, sample_fingerprint=None, sample_face_index=None):
     now = datetime.now(timezone.utc).isoformat()
-    normalized = np.asarray(embedding, dtype=np.float32)
-    normalized = normalized / max(float(np.linalg.norm(normalized)), 1e-12)
+    normalized = normalize_embedding(embedding)
     with engine.begin() as connection:
-        connection.execute(text("""
-            INSERT INTO face_profile_embeddings (profile_id, embedding, created_at)
-            VALUES (:profile_id, :embedding, :created_at)
+        result = connection.execute(text("""
+            INSERT INTO face_profile_embeddings (
+                profile_id, embedding, created_at, sample_fingerprint, sample_face_index
+            ) VALUES (
+                :profile_id, :embedding, :created_at, :sample_fingerprint, :sample_face_index
+            )
+            ON CONFLICT (profile_id, sample_fingerprint, sample_face_index)
+            WHERE sample_fingerprint IS NOT NULL AND sample_face_index IS NOT NULL
+            DO NOTHING
         """), {
             "profile_id": int(profile_id),
             "embedding": json.dumps(normalized.tolist()),
             "created_at": now,
+            "sample_fingerprint": sample_fingerprint,
+            "sample_face_index": sample_face_index,
         })
-        connection.execute(text("""
-            UPDATE face_profiles SET updated_at = :updated_at WHERE id = :profile_id
-        """), {"updated_at": now, "profile_id": int(profile_id)})
+        if result.rowcount:
+            connection.execute(text("""
+                UPDATE face_profiles SET updated_at = :updated_at WHERE id = :profile_id
+            """), {"updated_at": now, "profile_id": int(profile_id)})
+        return bool(result.rowcount)
 
 
 def update_face_profile_info(engine, profile_id, new_name="", description_addition="", notes_addition=""):
@@ -406,14 +453,15 @@ def find_face_profile_matches(embedding, profiles):
     The aggregate is a heuristic score, not an identity probability. Thresholds must be
     calibrated using consented, representative test photos before production use.
     """
-    query = np.asarray(embedding, dtype=np.float32)
-    query = query / max(float(np.linalg.norm(query)), 1e-12)
+    query = normalize_embedding(embedding)
     matches = []
     for profile in profiles:
         scores = []
         for sample in profile["embeddings"]:
-            sample = np.asarray(sample, dtype=np.float32)
-            sample = sample / max(float(np.linalg.norm(sample)), 1e-12)
+            try:
+                sample = normalize_embedding(sample)
+            except ValueError:
+                continue
             if sample.shape == query.shape:
                 scores.append(float(np.dot(query, sample)))
         if scores:
@@ -473,6 +521,7 @@ def record_profile_review(
             ) VALUES (
                 :profile_id, :image_fingerprint, :decision, :created_at, :similarity_score, :candidate_rank
             )
+            ON CONFLICT (profile_id, image_fingerprint, decision) DO NOTHING
         """), {
             "profile_id": int(profile_id),
             "image_fingerprint": image_fingerprint,
@@ -589,28 +638,6 @@ def validate_image(image):
         image = np.clip(np.nan_to_num(image), 0, 255).astype(np.uint8)
 
     return np.ascontiguousarray(image)
-
-
-def show_image(image, caption):
-    image = validate_image(image)
-
-    buffer = io.BytesIO()
-    Image.fromarray(image).save(buffer, format="PNG")
-    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-
-    st.markdown(f"**{caption}**")
-
-    st.html(
-        f"""
-        <div style="width:100%;overflow:hidden;">
-          <img
-            src="data:image/png;base64,{encoded}"
-            alt="Image preview"
-            style="display:block;width:100%;height:auto;object-fit:contain;"
-          />
-        </div>
-        """
-    )
 
 
 def distance(p1, p2, image_width=1, image_height=1):
@@ -876,32 +903,8 @@ def generate_ai_measurement_explanation(measurements, image_width, image_height,
     return "\n\n".join(f"**{field}:** {field_values[field]}" for field in ("Name", "Description", "Note", "Similarity"))
 
 
-st.title("AI Vision Lab")
-st.caption("Facial Landmark Analysis")
-
-with st.sidebar:
-    st.header("Settings")
-
-    source = st.radio(
-        "Image source",
-        ["Camera", "Upload image"],
-    )
-
-    show_landmarks = st.checkbox(
-        "Show landmark visualization",
-        value=True,
-    )
-
-    show_coordinates = st.checkbox(
-        "Show landmark coordinates",
-        value=False,
-    )
-
-    show_measurements = st.checkbox(
-        "Show measurement lines on image",
-        value=True,
-    )
-
+render_header()
+source, show_landmarks, show_coordinates, show_measurements = render_sidebar()
 
 uploaded_file = (
     st.camera_input("Take a picture")
@@ -926,7 +929,8 @@ except Exception as exc:
 if db_engine is None:
     st.caption("Database saving is unavailable until DATABASE_URL is configured correctly.")
     if db_error:
-        st.warning(f"Database connection failed: {db_error}")
+        # Keep connection strings and provider diagnostics out of the public UI.
+        st.warning("Database connection failed. Check DATABASE_URL in Streamlit Secrets and review the private app logs for details.")
 
 if uploaded_file is not None:
     try:
@@ -1125,6 +1129,7 @@ if uploaded_file is not None:
                             original.shape[0],
                             result,
                             profile_id=row_profile_id,
+                            image_fingerprint=current_image_fingerprint,
                         )
                         if row_profile_id is not None:
                             linked_rows += 1
@@ -1132,8 +1137,8 @@ if uploaded_file is not None:
                         st.success(f"Analysis saved. {linked_rows} face record linked to the confirmed profile.")
                     else:
                         st.success("Analysis saved. No profile was linked because no same-person match was confirmed for this image.")
-                except Exception as exc:
-                    st.error(f"Unable to save analysis: {exc}")
+                except Exception:
+                    st.error("Unable to save analysis. Check DATABASE_URL and the private app logs; connection details are not displayed here.")
 
 
 # Same-person profile matching is an opt-in, separate feature. The raw image is processed
@@ -1225,8 +1230,8 @@ if uploaded_file is not None and db_engine is not None:
                                 candidate_rank=next((i + 1 for i, m in enumerate(matches) if int(m["id"]) == int(selected_profile_id)), None),
                             )
                             st.success("Feedback saved: this uploaded face is a different person from the selected profile.")
-                        except Exception as exc:
-                            st.error(f"Could not save evaluation feedback: {exc}")
+                        except Exception:
+                            st.error("Could not save evaluation feedback. Check the private app logs for details.")
 
                 with st.expander("Update / Delete existing profile", expanded=True):
                     st.caption(
@@ -1272,7 +1277,9 @@ if uploaded_file is not None and db_engine is not None:
                                     notes_addition=notes_addition,
                                 )
                                 add_face_profile_sample(
-                                    db_engine, selected_profile_id, selected_identity["embedding"]
+                                    db_engine, selected_profile_id, selected_identity["embedding"],
+                                    sample_fingerprint=current_image_fingerprint,
+                                    sample_face_index=identity_index,
                                 )
                                 selected_profile_match = next(
                                     (m for m in matches if int(m["id"]) == int(selected_profile_id)), None
@@ -1298,8 +1305,8 @@ if uploaded_file is not None and db_engine is not None:
                                         "Click 'Save analysis to database' to link the measurement record."
                                     )
                                 st.rerun()
-                            except Exception as exc:
-                                st.error(f"Could not update face profile: {exc}")
+                            except Exception:
+                                st.error("Could not update the face profile. Check the private app logs for details; sensitive connection information is not shown here.")
 
                     st.divider()
                     st.markdown("**Delete this profile**")
@@ -1323,8 +1330,8 @@ if uploaded_file is not None and db_engine is not None:
                                 st.session_state.pop("confirmed_profile_image_fingerprint", None)
                                 st.success("Face profile deleted.")
                                 st.rerun()
-                            except Exception as exc:
-                                st.error(f"Could not delete face profile: {exc}")
+                            except Exception:
+                                st.error("Could not delete the face profile. Check the private app logs for details; sensitive connection information is not shown here.")
 
                     st.markdown("**Export this profile's accumulated analysis CSV**")
                     profile_rows = load_profile_analyses(db_engine, selected_profile_id)
@@ -1362,6 +1369,8 @@ if uploaded_file is not None and db_engine is not None:
                             profile_id = create_face_profile(
                                 db_engine, new_name, new_description, new_notes,
                                 selected_identity["embedding"],
+                                sample_fingerprint=current_image_fingerprint,
+                                sample_face_index=identity_index,
                             )
                             record_profile_review(db_engine, profile_id, current_image_fingerprint, "user_created_profile")
                             st.session_state["confirmed_profile_id_for_current_image"] = profile_id
@@ -1370,13 +1379,13 @@ if uploaded_file is not None and db_engine is not None:
                             st.session_state["confirmed_profile_identity_index"] = identity_index
                             st.success(f"Profile '{new_name.strip()}' saved (ID {profile_id}).")
                             st.rerun()
-                        except Exception as exc:
-                            st.error(f"Could not save face profile: {exc}")
+                        except Exception:
+                            st.error("Could not save the face profile. Check the private app logs for details; sensitive connection information is not shown here.")
 
-    except Exception as exc:
+    except Exception:
         st.warning(
             "Face profile matching is unavailable. Confirm that insightface and onnxruntime "
-            f"are installed and the model can load. Details: {exc}"
+            "are installed and the model can load. Check the private app logs for details."
         )
 
 
@@ -1452,8 +1461,8 @@ if db_engine is not None:
                 mime="text/csv",
                 key="download_match_evaluation_csv",
             )
-    except Exception as exc:
-        st.warning(f"Could not load match evaluation data: {exc}")
+    except Exception:
+        st.warning("Could not load match evaluation data. Check the private app logs for details.")
 
 
 # Keep the accumulated database export independent of the current image analysis.
@@ -1472,5 +1481,5 @@ if db_engine is not None:
             )
         else:
             st.caption("No saved database records yet. Click 'Save analysis to database' after analyzing an image to accumulate records.")
-    except Exception as exc:
-        st.warning(f"Could not load accumulated saved data: {exc}")
+    except Exception:
+        st.warning("Could not load accumulated saved data. Check the private app logs for details.")
