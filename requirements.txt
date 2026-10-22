@@ -7,3 +7,5 @@ pandas
 sqlalchemy
 psycopg[binary]
 google-genai
+insightface==0.7.3
+onnxruntime
