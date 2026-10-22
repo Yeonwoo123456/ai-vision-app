@@ -491,29 +491,6 @@ if uploaded_file is not None:
                 except Exception as exc:
                     st.error(f"Unable to save analysis: {exc}")
 
-        st.download_button(
-            "Download current analysis CSV",
-            data=summary.to_csv(index=False).encode("utf-8"),
-            file_name="analysis_summary.csv",
-            mime="text/csv",
-        )
-
-        if db_engine is not None:
-            try:
-                saved_rows = load_saved_analyses(db_engine)
-                if not saved_rows.empty:
-                    st.download_button(
-                        "Download accumulated saved data CSV",
-                        data=saved_rows.to_csv(index=False).encode("utf-8-sig"),
-                        file_name="analysis_history.csv",
-                        mime="text/csv",
-                        help="Downloads all analyses previously saved to the database.",
-                    )
-                else:
-                    st.caption("No saved database records yet. Click 'Save analysis to database' to accumulate records.")
-            except Exception as exc:
-                st.warning(f"Could not load accumulated saved data: {exc}")
-
         if show_coordinates:
             coordinates = pd.DataFrame(
                 faces[selected_index]["landmarks"]
@@ -537,3 +514,23 @@ if uploaded_file is not None:
                 file_name="landmark_coordinates.csv",
                 mime="text/csv",
             )
+
+
+# Keep the accumulated database export independent of the current image analysis.
+if db_engine is not None:
+    st.subheader("Accumulated Analysis Data")
+    try:
+        saved_rows = load_saved_analyses(db_engine)
+        if not saved_rows.empty:
+            st.download_button(
+                "Download accumulated saved data CSV",
+                data=saved_rows.to_csv(index=False).encode("utf-8-sig"),
+                file_name="analysis_history.csv",
+                mime="text/csv",
+                help="Downloads all analyses previously saved to the database.",
+                key="download_accumulated_analysis_csv",
+            )
+        else:
+            st.caption("No saved database records yet. Click 'Save analysis to database' after analyzing an image to accumulate records.")
+    except Exception as exc:
+        st.warning(f"Could not load accumulated saved data: {exc}")
