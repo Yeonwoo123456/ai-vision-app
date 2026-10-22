@@ -244,6 +244,48 @@ def add_face_profile_sample(engine, profile_id, embedding):
         """), {"updated_at": now, "profile_id": int(profile_id)})
 
 
+def update_face_profile_info(engine, profile_id, new_name="", description_addition="", notes_addition=""):
+    """Update an existing profile; append new descriptive details without erasing prior notes."""
+    now = datetime.now(timezone.utc).isoformat()
+    with engine.begin() as connection:
+        row = connection.execute(text("""
+            SELECT name, alias, description, notes
+            FROM face_profiles WHERE id = :profile_id
+            FOR UPDATE
+        """), {"profile_id": int(profile_id)}).mappings().first()
+        if row is None:
+            raise ValueError("The selected face profile no longer exists.")
+
+        current_name = (row["name"] or row["alias"] or "").strip()
+        current_description = (row["description"] or "").strip()
+        current_notes = (row["notes"] or "").strip()
+        proposed_name = (new_name or "").strip()
+        description_addition = (description_addition or "").strip()
+        notes_addition = (notes_addition or "").strip()
+
+        # Add only new, non-duplicate text. Existing profile information is preserved.
+        if description_addition and description_addition not in current_description:
+            current_description = "\n".join(part for part in [current_description, description_addition] if part)
+        if notes_addition and notes_addition not in current_notes:
+            current_notes = "\n".join(part for part in [current_notes, notes_addition] if part)
+
+        final_name = proposed_name or current_name
+        connection.execute(text("""
+            UPDATE face_profiles
+            SET name = :name, alias = :alias, description = :description,
+                notes = :notes, updated_at = :updated_at
+            WHERE id = :profile_id
+        """), {
+            "name": final_name,
+            "alias": final_name,
+            "description": current_description,
+            "notes": current_notes,
+            "updated_at": now,
+            "profile_id": int(profile_id),
+        })
+    return final_name
+
+
 def delete_face_profile(engine, profile_id):
     with engine.begin() as connection:
         # Preserve the accumulated measurement history; remove only its profile link.
@@ -939,20 +981,49 @@ if uploaded_file is not None and db_engine is not None:
                 st.markdown("**Manage existing profiles**")
                 profile_by_id = {profile["id"]: profile for profile in profiles}
                 selected_profile_id = st.selectbox(
-                    "Choose profile to add this face sample to",
+                    "Choose existing profile for this face",
                     list(profile_by_id.keys()),
                     format_func=lambda profile_id: profile_by_id[profile_id]["name"],
                     key="profile_sample_target",
                 )
-                confirm_link = st.checkbox(
-                    "I reviewed the candidate and confirm this sample belongs to the selected profile.",
-                    key="confirm_profile_link",
-                )
-                if st.button("Add face sample to selected profile", key="add_face_profile_sample"):
+                selected_profile = profile_by_id[selected_profile_id]
+                st.caption("After you confirm this is the same person, the new face sample is added and new information is appended to the existing profile. Existing notes are preserved.")
+                with st.form("update_existing_profile_form"):
+                    updated_name = st.text_input(
+                        "Update name (optional; leave blank to keep current name)",
+                        value=selected_profile["name"],
+                        max_chars=100,
+                    )
+                    description_addition = st.text_area(
+                        "New description to add (optional)",
+                        placeholder="Add new information; existing description will be preserved.",
+                        max_chars=1000,
+                    )
+                    notes_addition = st.text_area(
+                        "New notes to append (optional)",
+                        placeholder="Add new notes; existing notes will be preserved.",
+                        max_chars=3000,
+                    )
+                    confirm_link = st.checkbox(
+                        "I reviewed the candidate and confirm this sample belongs to the selected profile.",
+                        key="confirm_profile_link",
+                    )
+                    update_profile_submitted = st.form_submit_button(
+                        "Confirm same person & update existing profile"
+                    )
+
+                if update_profile_submitted:
                     if not confirm_link:
-                        st.error("Confirm the match before adding a sample.")
+                        st.error("Please confirm the same-person match before updating the profile.")
                     else:
                         try:
+                            final_name = update_face_profile_info(
+                                db_engine,
+                                selected_profile_id,
+                                new_name=updated_name,
+                                description_addition=description_addition,
+                                notes_addition=notes_addition,
+                            )
                             add_face_profile_sample(
                                 db_engine, selected_profile_id, selected_identity["embedding"]
                             )
@@ -962,12 +1033,12 @@ if uploaded_file is not None and db_engine is not None:
                             st.session_state["confirmed_profile_face_index"] = matched_measurement_index
                             st.session_state["confirmed_profile_identity_index"] = identity_index
                             if matched_measurement_index is None:
-                                st.warning("The identity detector and landmark detector could not confidently map this face to a measurement row. The embedding was saved, but this image's measurement row will not be linked to the profile.")
+                                st.warning("Profile information and face sample were updated, but the measurement detector could not confidently map this face to a row. The measurement record will not be linked until it can be mapped.")
                             else:
-                                st.success("Confirmed sample added. Save analysis to database to link this image's measurement record to the profile.")
+                                st.success(f"Profile '{final_name}' updated. New sample added; new description/notes were appended without deleting existing information. Click 'Save analysis to database' to link the measurement record.")
                             st.rerun()
                         except Exception as exc:
-                            st.error(f"Could not add face sample: {exc}")
+                            st.error(f"Could not update face profile: {exc}")
 
                 st.markdown("**Export this profile's accumulated analysis CSV**")
                 profile_rows = load_profile_analyses(db_engine, selected_profile_id)
