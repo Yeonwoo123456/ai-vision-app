@@ -8,6 +8,7 @@ import pandas as pd
 import streamlit as st
 from PIL import Image, ImageOps
 from sqlalchemy import create_engine, text
+from openai import OpenAI
 from detector import detect_faces
 
 
@@ -319,6 +320,63 @@ def pct(value):
     return f"{value * 100:.2f}%" if value is not None else "N/A"
 
 
+def get_openai_settings():
+    """Read OpenAI credentials from Streamlit Secrets or environment variables."""
+    try:
+        api_key = st.secrets.get("OPENAI_API_KEY", "")
+        model = st.secrets.get("OPENAI_MODEL", "gpt-5.5")
+    except Exception:
+        api_key = ""
+        model = "gpt-5.5"
+
+    if not api_key:
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not model:
+        model = os.environ.get("OPENAI_MODEL", "gpt-5.5")
+    return api_key, model
+
+
+def generate_ai_measurement_explanation(measurements, image_width, image_height):
+    """Explain numeric measurements with OpenAI; the image itself is never sent."""
+    api_key, model = get_openai_settings()
+    if not api_key:
+        raise ValueError("OpenAI API key is not configured. Add OPENAI_API_KEY to Streamlit Secrets.")
+
+    payload = {
+        "measurements": {
+            "eye_distance_relative": measurements.get("eye_distance"),
+            "face_width_relative": measurements.get("face_width"),
+            "face_height_relative": measurements.get("face_height"),
+            "face_width_height_ratio": measurements.get("width_height_ratio"),
+            "mouth_gap_relative": measurements.get("mouth_gap"),
+            "landmark_count": measurements.get("landmark_count"),
+            "face_index": measurements.get("face_index"),
+        },
+        "image_dimensions_pixels": {"width": image_width, "height": image_height},
+        "measurement_note": "Relative distances are normalized by the image diagonal, not physical measurements.",
+    }
+
+    client = OpenAI(api_key=api_key)
+    response = client.responses.create(
+        model=model,
+        instructions=(
+            "You are the AI Vision Lab measurement explainer. Explain the supplied computer-vision "
+            "measurements clearly and conservatively. Only numeric measurements are provided; no image is sent. "
+            "Explain what each metric represents and what can or cannot be inferred. Do not infer identity, age, "
+            "ethnicity, attractiveness, personality, health, emotion, or other personal traits. Do not claim the "
+            "values are centimeters or inches. Relative distances are normalized by the image diagonal and can "
+            "be affected by pose, perspective, image quality, and landmark estimation error. Comparisons require "
+            "consistent camera angle, pose, and image conditions. Use short headings and plain language. "
+            "If a value is null, state that it was unavailable. Distinguish data from interpretation."
+        ),
+        input=(
+            "Explain these measured results without inventing missing values:\n\n"
+            + pd.Series(payload).to_json(force_ascii=False, indent=2)
+        ),
+    )
+    return response.output_text.strip()
+
+
 st.title("AI Vision Lab")
 st.caption("Facial Landmark Analysis")
 
@@ -438,6 +496,30 @@ if uploaded_file is not None:
         e, f = st.columns(2)
         e.metric("Mouth opening", pct(selected["mouth_gap"]))
         f.metric("Landmarks", selected["landmark_count"])
+
+        st.subheader("AI Measurement Explanation")
+        st.caption(
+            "OpenAI explains the selected face's numeric measurements only. The image itself is not sent to OpenAI."
+        )
+        if st.button("Generate AI explanation", key="generate_ai_measurement_explanation"):
+            try:
+                with st.spinner("Generating explanation with OpenAI..."):
+                    explanation = generate_ai_measurement_explanation(
+                        selected, original.shape[1], original.shape[0]
+                    )
+                st.session_state["ai_measurement_explanation"] = explanation
+                st.session_state["ai_measurement_explanation_face"] = selected_index
+            except Exception as exc:
+                st.error(
+                    "Could not generate the AI explanation. Check OPENAI_API_KEY in Streamlit Secrets, "
+                    f"model access, and API limits. Details: {exc}"
+                )
+
+        if (
+            st.session_state.get("ai_measurement_explanation")
+            and st.session_state.get("ai_measurement_explanation_face") == selected_index
+        ):
+            st.markdown(st.session_state["ai_measurement_explanation"])
 
         rows = []
 
