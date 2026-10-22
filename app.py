@@ -8,7 +8,7 @@ import pandas as pd
 import streamlit as st
 from PIL import Image, ImageOps
 from sqlalchemy import create_engine, text
-from openai import OpenAI
+from google import genai
 from detector import detect_faces
 
 
@@ -320,27 +320,27 @@ def pct(value):
     return f"{value * 100:.2f}%" if value is not None else "N/A"
 
 
-def get_openai_settings():
-    """Read OpenAI credentials from Streamlit Secrets or environment variables."""
+def get_gemini_settings():
+    """Read Gemini credentials from Streamlit Secrets or environment variables."""
     try:
-        api_key = st.secrets.get("OPENAI_API_KEY", "")
-        model = st.secrets.get("OPENAI_MODEL", "gpt-5.5")
+        api_key = st.secrets.get("GEMINI_API_KEY", "")
+        model = st.secrets.get("GEMINI_MODEL", "gemini-3.8-flash")
     except Exception:
         api_key = ""
-        model = "gpt-5.5"
+        model = "gemini-3.8-flash"
 
     if not api_key:
-        api_key = os.environ.get("OPENAI_API_KEY", "")
+        api_key = os.environ.get("GEMINI_API_KEY", "")
     if not model:
-        model = os.environ.get("OPENAI_MODEL", "gpt-5.5")
+        model = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
     return api_key, model
 
 
 def generate_ai_measurement_explanation(measurements, image_width, image_height):
-    """Explain numeric measurements with OpenAI; the image itself is never sent."""
-    api_key, model = get_openai_settings()
+    """Explain numeric measurements with Gemini; the image itself is never sent."""
+    api_key, model = get_gemini_settings()
     if not api_key:
-        raise ValueError("OpenAI API key is not configured. Add OPENAI_API_KEY to Streamlit Secrets.")
+        raise ValueError("Gemini API key is not configured. Add GEMINI_API_KEY to Streamlit Secrets.")
 
     payload = {
         "measurements": {
@@ -356,25 +356,25 @@ def generate_ai_measurement_explanation(measurements, image_width, image_height)
         "measurement_note": "Relative distances are normalized by the image diagonal, not physical measurements.",
     }
 
-    client = OpenAI(api_key=api_key)
-    response = client.responses.create(
-        model=model,
-        instructions=(
-            "You are the AI Vision Lab measurement explainer. Explain the supplied computer-vision "
-            "measurements clearly and conservatively. Only numeric measurements are provided; no image is sent. "
-            "Explain what each metric represents and what can or cannot be inferred. Do not infer identity, age, "
-            "ethnicity, attractiveness, personality, health, emotion, or other personal traits. Do not claim the "
-            "values are centimeters or inches. Relative distances are normalized by the image diagonal and can "
-            "be affected by pose, perspective, image quality, and landmark estimation error. Comparisons require "
-            "consistent camera angle, pose, and image conditions. Use short headings and plain language. "
-            "If a value is null, state that it was unavailable. Distinguish data from interpretation."
-        ),
-        input=(
-            "Explain these measured results without inventing missing values:\n\n"
-            + pd.Series(payload).to_json(force_ascii=False, indent=2)
-        ),
+    prompt = (
+        "You are the AI Vision Lab measurement explainer. Explain the supplied computer-vision "
+        "measurements clearly and conservatively. Only numeric measurements are provided; no image is sent. "
+        "Explain what each metric represents and what can or cannot be inferred. Do not infer identity, age, "
+        "ethnicity, attractiveness, personality, health, emotion, or other personal traits. Do not claim the "
+        "values are centimeters or inches. Relative distances are normalized by the image diagonal and can "
+        "be affected by pose, perspective, image quality, and landmark estimation error. Comparisons require "
+        "consistent camera angle, pose, and image conditions. Use short headings and plain language. "
+        "If a value is null, state that it was unavailable. Distinguish data from interpretation.\n\n"
+        "Explain these measured results without inventing missing values:\n\n"
+        + pd.Series(payload).to_json(force_ascii=False, indent=2)
     )
-    return response.output_text.strip()
+
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(model=model, contents=prompt)
+    output = (response.text or "").strip()
+    if not output:
+        raise ValueError("Gemini returned an empty explanation. Please try again.")
+    return output
 
 
 st.title("AI Vision Lab")
@@ -448,16 +448,6 @@ if uploaded_file is not None:
 
     analyses = [analyze_face(face, original.shape[1], original.shape[0]) for face in faces]
 
-    st.subheader("Analysis Overview")
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Faces detected", len(faces))
-    c2.metric(
-        "Total landmarks",
-        sum(face["landmark_count"] for face in faces),
-    )
-    c3.metric("Width", f"{original.shape[1]} px")
-    c4.metric("Height", f"{original.shape[0]} px")
 
     if show_landmarks and show_measurements and faces:
         for detected_face in faces:
@@ -472,38 +462,23 @@ if uploaded_file is not None:
     if not faces:
         st.warning("No face was detected.")
     else:
-        st.subheader("Feature Measurements")
-
         selected_index = st.selectbox(
-            "Select face",
+            "Select face for AI explanation",
             range(len(faces)),
             format_func=lambda i: f"Face {i + 1}",
         )
 
         selected = analyses[selected_index]
 
-        a, b, c, d = st.columns(4)
-        a.metric("Eye distance", pct(selected["eye_distance"]))
-        b.metric("Face width", pct(selected["face_width"]))
-        c.metric("Face height", pct(selected["face_height"]))
-        d.metric(
-            "Width / height",
-            f'{selected["width_height_ratio"]:.3f}'
-            if selected["width_height_ratio"] is not None
-            else "N/A",
-        )
-
-        e, f = st.columns(2)
-        e.metric("Mouth opening", pct(selected["mouth_gap"]))
-        f.metric("Landmarks", selected["landmark_count"])
-
+        # Show only the AI's natural-language interpretation to the user.
+        # Raw measurement metrics remain internal for AI explanation and database persistence.
         st.subheader("AI Measurement Explanation")
         st.caption(
-            "OpenAI explains the selected face's numeric measurements only. The image itself is not sent to OpenAI."
+            "The explanation is based on measured landmark values. The image itself is not sent to Gemini."
         )
         if st.button("Generate AI explanation", key="generate_ai_measurement_explanation"):
             try:
-                with st.spinner("Generating explanation with OpenAI..."):
+                with st.spinner("Generating explanation with Gemini..."):
                     explanation = generate_ai_measurement_explanation(
                         selected, original.shape[1], original.shape[0]
                     )
@@ -511,7 +486,7 @@ if uploaded_file is not None:
                 st.session_state["ai_measurement_explanation_face"] = selected_index
             except Exception as exc:
                 st.error(
-                    "Could not generate the AI explanation. Check OPENAI_API_KEY in Streamlit Secrets, "
+                    "Could not generate the AI explanation. Check GEMINI_API_KEY in Streamlit Secrets, "
                     f"model access, and API limits. Details: {exc}"
                 )
 
@@ -520,58 +495,6 @@ if uploaded_file is not None:
             and st.session_state.get("ai_measurement_explanation_face") == selected_index
         ):
             st.markdown(st.session_state["ai_measurement_explanation"])
-
-        rows = []
-
-        for result in analyses:
-            rows.append({
-                "Face": result["face_index"] + 1,
-                "Landmarks": result["landmark_count"],
-                "Eye distance (%)": (
-                    round(result["eye_distance"] * 100, 2)
-                    if result["eye_distance"] is not None else None
-                ),
-                "Face width (%)": (
-                    round(result["face_width"] * 100, 2)
-                    if result["face_width"] is not None else None
-                ),
-                "Face height (%)": (
-                    round(result["face_height"] * 100, 2)
-                    if result["face_height"] is not None else None
-                ),
-                "Width/height ratio": result["width_height_ratio"],
-                "Mouth opening (%)": (
-                    round(result["mouth_gap"] * 100, 2)
-                    if result["mouth_gap"] is not None else None
-                ),
-            })
-
-        summary = pd.DataFrame(rows)
-
-        st.subheader("Face Summary")
-        st.dataframe(summary, use_container_width=True, hide_index=True)
-
-        # Always display the Save button. If the database is unavailable,
-        # show a clear message after the user clicks it instead of hiding it.
-        if st.button("Save analysis to database", key="save_analysis_to_database"):
-            if db_engine is None:
-                st.error(
-                    "Cannot save because the database is not connected. "
-                    "Check DATABASE_URL in Streamlit Secrets and the connection error above."
-                )
-            else:
-                try:
-                    for result in analyses:
-                        save_analysis(
-                            db_engine,
-                            len(faces),
-                            original.shape[1],
-                            original.shape[0],
-                            result,
-                        )
-                    st.success("Analysis summary saved to database.")
-                except Exception as exc:
-                    st.error(f"Unable to save analysis: {exc}")
 
         if show_coordinates:
             coordinates = pd.DataFrame(
@@ -596,6 +519,28 @@ if uploaded_file is not None:
                 file_name="landmark_coordinates.csv",
                 mime="text/csv",
             )
+
+        # Keep database saving below the natural-language explanation.
+        st.divider()
+        if st.button("Save analysis to database", key="save_analysis_to_database"):
+            if db_engine is None:
+                st.error(
+                    "Cannot save because the database is not connected. "
+                    "Check DATABASE_URL in Streamlit Secrets and the connection error above."
+                )
+            else:
+                try:
+                    for result in analyses:
+                        save_analysis(
+                            db_engine,
+                            len(faces),
+                            original.shape[1],
+                            original.shape[0],
+                            result,
+                        )
+                    st.success("Analysis summary saved to database.")
+                except Exception as exc:
+                    st.error(f"Unable to save analysis: {exc}")
 
 
 # Keep the accumulated database export independent of the current image analysis.
