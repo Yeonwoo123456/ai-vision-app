@@ -14,13 +14,9 @@ from google import genai
 from detector import detect_faces
 from ui import configure_page, render_header, render_sidebar, show_image
 
-
 configure_page()
 
-
-
 def get_database_url():
-    """Read the Neon connection string from Streamlit Secrets or environment."""
     try:
         url = st.secrets.get("DATABASE_URL", "")
     except Exception:
@@ -36,14 +32,12 @@ def get_database_url():
 
     return url
 
-
 @st.cache_resource
 def get_engine():
     url = get_database_url()
     if not url:
         return None
     return create_engine(url, pool_pre_ping=True, pool_recycle=300)
-
 
 def initialize_database(engine):
     with engine.begin() as connection:
@@ -64,13 +58,12 @@ def initialize_database(engine):
                 profile_id BIGINT NULL
             )
         """))
-        # Safe migration for existing Neon databases created before profile linking.
+                                                                                    
         connection.execute(text("ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS profile_id BIGINT NULL"))
-        # Idempotency key: the same uploaded image/face should not create duplicate history rows.
+                                                                                                 
         connection.execute(text("ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS image_fingerprint TEXT NULL"))
         connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_analysis_image_face ON analysis_history (image_fingerprint, face_index) WHERE image_fingerprint IS NOT NULL"))
-        # Identity profiles are separate from measurement history. Only embeddings and
-        # user-entered profile text are stored; source images are not persisted.
+
         connection.execute(text("""
             CREATE TABLE IF NOT EXISTS face_profiles (
                 id BIGSERIAL PRIMARY KEY,
@@ -82,7 +75,7 @@ def initialize_database(engine):
                 updated_at TEXT NOT NULL
             )
         """))
-        # Backward-compatible migration: old profiles used alias; new UI uses name.
+                                                                                   
         connection.execute(text("ALTER TABLE face_profiles ADD COLUMN IF NOT EXISTS name TEXT"))
         connection.execute(text("UPDATE face_profiles SET name = alias WHERE name IS NULL OR name = ''"))
         connection.execute(text("""
@@ -98,34 +91,8 @@ def initialize_database(engine):
         connection.execute(text("ALTER TABLE face_profile_embeddings ADD COLUMN IF NOT EXISTS sample_fingerprint TEXT NULL"))
         connection.execute(text("ALTER TABLE face_profile_embeddings ADD COLUMN IF NOT EXISTS sample_face_index INTEGER NULL"))
         connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_profile_sample_fingerprint ON face_profile_embeddings (profile_id, sample_fingerprint, sample_face_index) WHERE sample_fingerprint IS NOT NULL AND sample_face_index IS NOT NULL"))
-        connection.execute(text("""
-            CREATE TABLE IF NOT EXISTS face_match_reviews (
-                id BIGSERIAL PRIMARY KEY,
-                profile_id BIGINT NOT NULL REFERENCES face_profiles(id) ON DELETE CASCADE,
-                image_fingerprint TEXT NOT NULL,
-                decision TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                similarity_score DOUBLE PRECISION NULL,
-                candidate_rank INTEGER NULL
-            )
-        """))
-        # Safe migration for review records created by earlier app versions.
-        connection.execute(text("ALTER TABLE face_match_reviews ADD COLUMN IF NOT EXISTS similarity_score DOUBLE PRECISION NULL"))
-        connection.execute(text("ALTER TABLE face_match_reviews ADD COLUMN IF NOT EXISTS candidate_rank INTEGER NULL"))
-        # Remove duplicate historical review events before enforcing idempotency going forward.
-        connection.execute(text("""
-            DELETE FROM face_match_reviews older
-            USING face_match_reviews newer
-            WHERE older.profile_id = newer.profile_id
-              AND older.image_fingerprint = newer.image_fingerprint
-              AND older.decision = newer.decision
-              AND older.id < newer.id
-        """))
-        connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_profile_review_event ON face_match_reviews (profile_id, image_fingerprint, decision)"))
-
 
 def save_analysis(engine, face_count, width, height, result, profile_id=None, image_fingerprint=None):
-    """Idempotently save a face analysis; repeated clicks do not duplicate the same image/face."""
     created_at = datetime.now(timezone.utc).isoformat()
     with engine.begin() as connection:
         connection.execute(
@@ -154,9 +121,7 @@ def save_analysis(engine, face_count, width, height, result, profile_id=None, im
             },
         )
 
-
 def load_saved_analyses(engine):
-    """Load all saved measurement rows so the CSV can accumulate across sessions."""
     with engine.connect() as connection:
         result = connection.execute(text("""
             SELECT h.id, h.created_at, h.face_count, h.image_width, h.image_height,
@@ -169,23 +134,15 @@ def load_saved_analyses(engine):
         """))
         return pd.DataFrame(result.mappings().all())
 
-
 @st.cache_resource
 def get_face_embedding_model():
-    """Load InsightFace once. It detects faces and creates identity embeddings locally."""
     from insightface.app import FaceAnalysis
 
     model = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
     model.prepare(ctx_id=-1, det_size=(640, 640))
     return model
 
-
 def assess_face_quality(image_rgb, bbox, det_score, keypoints=None):
-    """Estimate input quality from face size, detector confidence, blur and pose cues.
-
-    These are screening heuristics, not a guarantee that a face match is correct.
-    The source image is processed in memory and is not persisted by this function.
-    """
     import cv2
 
     height, width = image_rgb.shape[:2]
@@ -209,7 +166,6 @@ def assess_face_quality(image_rgb, bbox, det_score, keypoints=None):
         brightness_mean = float(np.mean(gray_crop))
         brightness_std = float(np.std(gray_crop))
 
-    # Face size relative to the full image helps detect distant/tiny face crops.
     face_area_ratio = float((face_width * face_height) / max(width * height, 1))
     if min(face_width, face_height) < 90 or face_area_ratio < 0.012:
         warnings.append("Face is small in the image; use a closer, higher-resolution photo.")
@@ -224,8 +180,6 @@ def assess_face_quality(image_rgb, bbox, det_score, keypoints=None):
     if brightness_std is not None and brightness_std < 18:
         warnings.append("The face crop has very little contrast; use a clearer photo with balanced lighting.")
 
-    # Approximate pose cues from InsightFace's five keypoints (eyes, nose, mouth corners).
-    # These are screening heuristics, not precise pose estimates.
     pose_offset = None
     eye_roll_degrees = None
     if keypoints is not None:
@@ -238,8 +192,7 @@ def assess_face_quality(image_rgb, bbox, det_score, keypoints=None):
                 if eye_distance > 1e-6:
                     pose_offset = float(abs(pts[2][0] - eye_mid[0]) / eye_distance)
                     raw_eye_angle = abs(float(np.degrees(np.arctan2(eye_delta[1], eye_delta[0]))))
-                    # Eye keypoint order can run either left-to-right or right-to-left.
-                    # Normalize orientation so a horizontal eye line is close to 0 degrees.
+
                     eye_roll_degrees = min(raw_eye_angle, abs(180.0 - raw_eye_angle))
                     if pose_offset > 0.22:
                         warnings.append("The face may be turned to the side; a more front-facing photo may match better.")
@@ -249,8 +202,6 @@ def assess_face_quality(image_rgb, bbox, det_score, keypoints=None):
             pose_offset = None
             eye_roll_degrees = None
 
-    # A conservative quality gate. Warnings can appear before a hard block; quality is
-    # only a photo-screening signal and does not establish identity.
     quality_ok = (
         min(face_width, face_height) >= 80
         and face_area_ratio >= 0.008
@@ -274,9 +225,7 @@ def assess_face_quality(image_rgb, bbox, det_score, keypoints=None):
         "warnings": warnings,
     }
 
-
 def get_identity_faces(image_rgb):
-    """Return local face embeddings and quality metadata; never saves the source image."""
     image_rgb = validate_image(image_rgb)
     image_bgr = np.ascontiguousarray(image_rgb[:, :, ::-1])
     detections = get_face_embedding_model().get(image_bgr)
@@ -297,7 +246,6 @@ def get_identity_faces(image_rgb):
             "quality": quality,
         })
     return results
-
 
 def load_face_profiles(engine):
     with engine.connect() as connection:
@@ -323,13 +271,11 @@ def load_face_profiles(engine):
                 vector = normalize_embedding(json.loads(row["embedding"]))
                 profiles[profile_id]["embeddings"].append(vector)
             except (ValueError, TypeError, json.JSONDecodeError):
-                # Ignore malformed legacy samples rather than breaking all profile matching.
+                                                                                            
                 continue
     return list(profiles.values())
 
-
 def normalize_embedding(embedding):
-    """Validate and L2-normalize an embedding before storing or comparing it."""
     vector = np.asarray(embedding, dtype=np.float32).reshape(-1)
     if vector.size == 0 or not np.all(np.isfinite(vector)):
         raise ValueError("The face model returned an invalid embedding. Please retry with another image.")
@@ -337,7 +283,6 @@ def normalize_embedding(embedding):
     if not np.isfinite(norm) or norm <= 1e-12:
         raise ValueError("The face model returned an empty embedding. Please retry with another image.")
     return vector / norm
-
 
 def create_face_profile(engine, name, description, notes, embedding, sample_fingerprint=None, sample_face_index=None):
     now = datetime.now(timezone.utc).isoformat()
@@ -369,7 +314,6 @@ def create_face_profile(engine, name, description, notes, embedding, sample_fing
         })
     return profile_id
 
-
 def add_face_profile_sample(engine, profile_id, embedding, sample_fingerprint=None, sample_face_index=None):
     now = datetime.now(timezone.utc).isoformat()
     normalized = normalize_embedding(embedding)
@@ -396,9 +340,7 @@ def add_face_profile_sample(engine, profile_id, embedding, sample_fingerprint=No
             """), {"updated_at": now, "profile_id": int(profile_id)})
         return bool(result.rowcount)
 
-
 def update_face_profile_info(engine, profile_id, new_name="", description_addition="", notes_addition=""):
-    """Update an existing profile; append new descriptive details without erasing prior notes."""
     now = datetime.now(timezone.utc).isoformat()
     with engine.begin() as connection:
         row = connection.execute(text("""
@@ -416,7 +358,6 @@ def update_face_profile_info(engine, profile_id, new_name="", description_additi
         description_addition = (description_addition or "").strip()
         notes_addition = (notes_addition or "").strip()
 
-        # Add only new, non-duplicate text. Existing profile information is preserved.
         if description_addition and description_addition not in current_description:
             current_description = "\n".join(part for part in [current_description, description_addition] if part)
         if notes_addition and notes_addition not in current_notes:
@@ -438,21 +379,13 @@ def update_face_profile_info(engine, profile_id, new_name="", description_additi
         })
     return final_name
 
-
 def delete_face_profile(engine, profile_id):
     with engine.begin() as connection:
-        # Preserve the accumulated measurement history; remove only its profile link.
+                                                                                     
         connection.execute(text("UPDATE analysis_history SET profile_id = NULL WHERE profile_id = :id"), {"id": int(profile_id)})
-        connection.execute(text("DELETE FROM face_match_reviews WHERE profile_id = :id"), {"id": int(profile_id)})
         connection.execute(text("DELETE FROM face_profiles WHERE id = :id"), {"id": int(profile_id)})
 
-
 def find_face_profile_matches(embedding, profiles):
-    """Rank profiles against multiple saved samples, not just a single best sample.
-
-    The aggregate is a heuristic score, not an identity probability. Thresholds must be
-    calibrated using consented, representative test photos before production use.
-    """
     query = normalize_embedding(embedding)
     matches = []
     for profile in profiles:
@@ -469,7 +402,7 @@ def find_face_profile_matches(embedding, profiles):
             top_scores = scores[:min(3, len(scores))]
             best_score = top_scores[0]
             top_mean = float(np.mean(top_scores))
-            # Blend best match with consistency across the closest few samples.
+                                                                               
             aggregate_score = 0.65 * best_score + 0.35 * top_mean
             matches.append({
                 **profile,
@@ -480,14 +413,10 @@ def find_face_profile_matches(embedding, profiles):
             })
     return sorted(matches, key=lambda item: item["similarity"], reverse=True)
 
-
 def get_image_fingerprint(uploaded_file):
-    """Ephemeral identifier used to avoid attaching a confirmed profile to another upload."""
     return hashlib.sha256(uploaded_file.getvalue()).hexdigest()
 
-
 def map_identity_face_to_measurement_face(identity_face, measurement_faces, image_width, image_height):
-    """Map detector outputs by normalized face-box center, not by assumed list ordering."""
     if not measurement_faces:
         return None
     x1, y1, x2, y2 = identity_face["bbox"]
@@ -505,49 +434,10 @@ def map_identity_face_to_measurement_face(identity_face, measurement_faces, imag
         distance = float(np.hypot(target_x - center_x, target_y - center_y))
         if distance < best_distance:
             best_index, best_distance = i, distance
-    # Avoid linking records if the two detectors' face locations disagree substantially.
+                                                                                        
     return best_index if best_index is not None and best_distance <= 0.18 else None
 
-
-def record_profile_review(
-    engine, profile_id, image_fingerprint, decision="user_confirmed_same_person",
-    similarity_score=None, candidate_rank=None,
-):
-    """Store a human-reviewed match label for later evaluation; not model training."""
-    with engine.begin() as connection:
-        connection.execute(text("""
-            INSERT INTO face_match_reviews (
-                profile_id, image_fingerprint, decision, created_at, similarity_score, candidate_rank
-            ) VALUES (
-                :profile_id, :image_fingerprint, :decision, :created_at, :similarity_score, :candidate_rank
-            )
-            ON CONFLICT (profile_id, image_fingerprint, decision) DO NOTHING
-        """), {
-            "profile_id": int(profile_id),
-            "image_fingerprint": image_fingerprint,
-            "decision": decision,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "similarity_score": float(similarity_score) if similarity_score is not None else None,
-            "candidate_rank": int(candidate_rank) if candidate_rank is not None else None,
-        })
-
-
-def load_match_review_data(engine):
-    """Load user-labeled match outcomes for evaluation and CSV export."""
-    with engine.connect() as connection:
-        rows = connection.execute(text("""
-            SELECT r.id, r.created_at, r.profile_id,
-                   COALESCE(NULLIF(p.name, ''), p.alias, '[deleted profile]') AS profile_name,
-                   r.decision, r.similarity_score, r.candidate_rank, r.image_fingerprint
-            FROM face_match_reviews r
-            LEFT JOIN face_profiles p ON p.id = r.profile_id
-            ORDER BY r.id DESC
-        """)).mappings().all()
-    return pd.DataFrame(rows)
-
-
 def get_match_threshold():
-    """Read the candidate threshold from Streamlit Secrets/env; default is a placeholder."""
     raw_value = None
     try:
         raw_value = st.secrets.get("MATCH_THRESHOLD", None)
@@ -560,41 +450,6 @@ def get_match_threshold():
     except (TypeError, ValueError):
         value = 0.45
     return min(0.99, max(0.01, value))
-
-
-def evaluate_reviewed_thresholds(review_df):
-    """Evaluate candidate thresholds against human-labeled comparisons only."""
-    if review_df is None or review_df.empty or "similarity_score" not in review_df.columns:
-        return pd.DataFrame()
-    labeled = review_df[review_df["decision"].isin([
-        "user_confirmed_same_person", "user_confirmed_different_person"
-    ])].copy()
-    labeled["similarity_score"] = pd.to_numeric(labeled["similarity_score"], errors="coerce")
-    labeled = labeled.dropna(subset=["similarity_score"])
-    if labeled.empty:
-        return pd.DataFrame()
-    actual_same = (labeled["decision"] == "user_confirmed_same_person").to_numpy(dtype=bool)
-    scores = labeled["similarity_score"].to_numpy(dtype=float)
-    rows = []
-    for threshold in np.round(np.arange(0.30, 0.851, 0.01), 2):
-        predicted_same = scores >= threshold
-        tp = int(np.sum(predicted_same & actual_same))
-        fp = int(np.sum(predicted_same & ~actual_same))
-        tn = int(np.sum(~predicted_same & ~actual_same))
-        fn = int(np.sum(~predicted_same & actual_same))
-        precision = tp / (tp + fp) if tp + fp else 0.0
-        recall = tp / (tp + fn) if tp + fn else 0.0
-        specificity = tn / (tn + fp) if tn + fp else 0.0
-        balanced_accuracy = (recall + specificity) / 2 if (tp + fn) and (tn + fp) else None
-        rows.append({
-            "threshold": float(threshold), "true_positive": tp, "false_positive": fp,
-            "true_negative": tn, "false_negative": fn, "precision": precision,
-            "recall": recall, "specificity": specificity,
-            "balanced_accuracy": balanced_accuracy,
-            "labeled_comparisons": int(len(scores)),
-        })
-    return pd.DataFrame(rows)
-
 
 def load_profile_analyses(engine, profile_id):
     with engine.connect() as connection:
@@ -610,7 +465,6 @@ def load_profile_analyses(engine, profile_id):
         """), {"profile_id": int(profile_id)}).mappings().all()
     return pd.DataFrame(rows)
 
-
 def load_image(uploaded_file):
     data = uploaded_file.getvalue()
 
@@ -623,7 +477,6 @@ def load_image(uploaded_file):
         result = np.asarray(image, dtype=np.uint8)
 
     return np.ascontiguousarray(result)
-
 
 def validate_image(image):
     image = np.asarray(image)
@@ -639,16 +492,13 @@ def validate_image(image):
 
     return np.ascontiguousarray(image)
 
-
 def distance(p1, p2, image_width=1, image_height=1):
-    """Return distance normalized by the image diagonal, accounting for aspect ratio."""
     dx = (p1["x"] - p2["x"]) * image_width
     dy = (p1["y"] - p2["y"]) * image_height
     diagonal = float(np.hypot(image_width, image_height))
     if diagonal <= 0:
         return None
     return float(np.hypot(dx, dy) / diagonal)
-
 
 def center(landmarks, indices):
     points = [landmarks[i] for i in indices if i < len(landmarks)]
@@ -661,7 +511,6 @@ def center(landmarks, indices):
         "y": float(np.mean([p["y"] for p in points])),
         "z": float(np.mean([p["z"] for p in points])),
     }
-
 
 def analyze_face(face, image_width=1, image_height=1):
     points = face["landmarks"]
@@ -708,10 +557,7 @@ def analyze_face(face, image_width=1, image_height=1):
         "mouth_gap": mouth_gap,
     }
 
-
-
 def draw_measurement_overlay(image, face):
-    """Draw color-coded facial regions and measurement guides on an RGB image."""
     image = validate_image(image).copy()
     height, width = image.shape[:2]
     points = face.get("landmarks", [])
@@ -748,7 +594,6 @@ def draw_measurement_overlay(image, face):
                 x, y = pt
                 draw.ellipse((x-radius, y-radius, x+radius, y+radius), fill=color, outline=(255, 255, 255), width=1)
 
-    # MediaPipe Face Mesh contours: distinct colors for the main facial regions.
     face_oval = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
                  397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
                  172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109]
@@ -801,13 +646,10 @@ def draw_measurement_overlay(image, face):
 
     return np.asarray(canvas)
 
-
 def pct(value):
     return f"{value * 100:.2f}%" if value is not None else "N/A"
 
-
 def get_gemini_settings():
-    """Read Gemini credentials from Streamlit Secrets or environment variables."""
     try:
         api_key = st.secrets.get("GEMINI_API_KEY", "")
         model = st.secrets.get("GEMINI_MODEL", "gemini-2.5-flash")
@@ -821,9 +663,7 @@ def get_gemini_settings():
         model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
     return api_key, model
 
-
 def generate_ai_measurement_explanation(measurements, image_width, image_height, profile_context=None):
-    """Show saved-profile context only; do not call Gemini when no profile matches."""
     profile_context = profile_context or {}
     if profile_context.get("no_match") or profile_context.get("status") == "no saved profile match":
         return "No profile matching this person was found. If you would like, please create a new profile."
@@ -832,8 +672,6 @@ def generate_ai_measurement_explanation(measurements, image_width, image_height,
     if not api_key:
         raise ValueError("Gemini API key is not configured. Add GEMINI_API_KEY to Streamlit Secrets.")
 
-    # Deliberately provide only saved profile metadata to Gemini. Raw measurements,
-    # measurement summaries, and limitation sections are not part of the visible AI output.
     profile_payload = {
         "saved_profile_name": profile_context.get("name"),
         "user_provided_description": profile_context.get("description", ""),
@@ -862,7 +700,7 @@ def generate_ai_measurement_explanation(measurements, image_width, image_height,
     client = genai.Client(api_key=api_key)
     response = None
     last_error = None
-    # Gemini 503 UNAVAILABLE is usually temporary. Retry briefly with backoff.
+                                                                              
     for attempt in range(3):
         try:
             response = client.models.generate_content(model=model, contents=prompt)
@@ -881,7 +719,6 @@ def generate_ai_measurement_explanation(measurements, image_width, image_height,
     if not output:
         raise ValueError("Gemini returned an empty profile context. Please try again.")
 
-    # Normalize to the exact four requested fields, even if Gemini adds extra prose.
     import re
     output = re.sub(r"(?im)^#+\s*Profile context\s*$", "", output).strip()
     field_values = {}
@@ -902,7 +739,6 @@ def generate_ai_measurement_explanation(measurements, image_width, image_height,
             field_values["Similarity"] += "; confirm before linking"
     return "\n\n".join(f"**{field}:** {field_values[field]}" for field in ("Name", "Description", "Note", "Similarity"))
 
-
 render_header()
 source, show_landmarks, show_coordinates, show_measurements = render_sidebar()
 
@@ -915,7 +751,6 @@ uploaded_file = (
     )
 )
 
-# Connect to the database for saving only; no history table or graph is displayed.
 db_engine = None
 db_error = None
 try:
@@ -929,7 +764,7 @@ except Exception as exc:
 if db_engine is None:
     st.caption("Database saving is unavailable until DATABASE_URL is configured correctly.")
     if db_error:
-        # Keep connection strings and provider diagnostics out of the public UI.
+                                                                                
         st.warning("Database connection failed. Check DATABASE_URL in Streamlit Secrets and review the private app logs for details.")
 
 if uploaded_file is not None:
@@ -937,7 +772,6 @@ if uploaded_file is not None:
         original = load_image(uploaded_file)
         current_image_fingerprint = get_image_fingerprint(uploaded_file)
 
-        # A profile confirmation is valid only for the exact current upload.
         if st.session_state.get("confirmed_profile_image_fingerprint") != current_image_fingerprint:
             st.session_state.pop("confirmed_profile_id_for_current_image", None)
             st.session_state.pop("confirmed_profile_face_index", None)
@@ -957,7 +791,6 @@ if uploaded_file is not None:
         st.stop()
 
     analyses = [analyze_face(face, original.shape[1], original.shape[0]) for face in faces]
-
 
     if show_landmarks and show_measurements and faces:
         for detected_face in faces:
@@ -980,8 +813,6 @@ if uploaded_file is not None:
 
         selected = analyses[selected_index]
 
-        # Show only the AI's natural-language interpretation to the user.
-        # Raw measurement metrics remain internal for AI explanation and database persistence.
         st.subheader("AI Measurement Explanation")
         st.caption(
             "The explanation is based on measured landmark values. The image itself is not sent to Gemini."
@@ -1097,7 +928,6 @@ if uploaded_file is not None:
                 mime="text/csv",
             )
 
-        # Keep database saving below the natural-language explanation.
         st.divider()
         if st.button("Save analysis to database", key="save_analysis_to_database"):
             if db_engine is None:
@@ -1111,7 +941,7 @@ if uploaded_file is not None:
                     confirmed_face_index = st.session_state.get("confirmed_profile_face_index")
                     confirmed_identity_index = st.session_state.get("confirmed_profile_identity_index")
                     active_identity_index = st.session_state.get("identity_face_select")
-                    # A confirmation only applies to the exact upload and selected face.
+                                                                                        
                     if confirmed_identity_index != active_identity_index:
                         confirmed_profile_id = None
                         confirmed_face_index = None
@@ -1140,9 +970,6 @@ if uploaded_file is not None:
                 except Exception:
                     st.error("Unable to save analysis. Check DATABASE_URL and the private app logs; connection details are not displayed here.")
 
-
-# Same-person profile matching is an opt-in, separate feature. The raw image is processed
-# locally; only the numeric embedding and user-entered name/description/notes are persisted.
 if uploaded_file is not None and db_engine is not None:
     st.divider()
     st.subheader("Face Identity Profiles")
@@ -1187,16 +1014,13 @@ if uploaded_file is not None and db_engine is not None:
                 st.caption("These are heuristic image-quality indicators, not identity-confidence scores or precise pose measurements.")
 
             matches = find_face_profile_matches(selected_identity["embedding"], profiles) if quality.get("quality_ok") else []
-            # Candidate profile details are intentionally hidden in this section.
-            # Low-quality images are not ranked; ask for a clearer, more frontal photo.
+
             match_threshold = get_match_threshold()
             candidate = matches[0] if matches and matches[0]["similarity"] >= match_threshold else None
             if not quality.get("quality_ok"):
                 st.info("Profile matching is paused for this image because quality is below the minimum screening threshold. Upload a clearer, larger, sharper, more front-facing photo.")
             elif profiles and not candidate:
                 st.caption(f"No profile reached the current candidate threshold ({match_threshold:.2f}). This does not prove the person is new.")
-
-            # They are shown only inside AI Explanation after the user requests it.
 
             if profiles:
                 st.markdown("**Manage existing profiles**")
@@ -1208,30 +1032,6 @@ if uploaded_file is not None and db_engine is not None:
                     key="profile_sample_target",
                 )
                 selected_profile = profile_by_id[selected_profile_id]
-
-                # Explicit negative feedback helps measure false-match behavior.
-                # It does not delete or modify the selected profile.
-                st.caption("Accuracy feedback: use this only after reviewing the selected profile against the uploaded face.")
-                if st.button(
-                    "Mark selected profile as a different person",
-                    key="mark_selected_profile_different_person",
-                ):
-                    if not quality.get("quality_ok", False):
-                        st.error("The image quality is too low to label this comparison reliably.")
-                    else:
-                        selected_profile_match = next(
-                            (m for m in matches if int(m["id"]) == int(selected_profile_id)), None
-                        )
-                        try:
-                            record_profile_review(
-                                db_engine, selected_profile_id, current_image_fingerprint,
-                                decision="user_confirmed_different_person",
-                                similarity_score=(selected_profile_match["similarity"] if selected_profile_match else None),
-                                candidate_rank=next((i + 1 for i, m in enumerate(matches) if int(m["id"]) == int(selected_profile_id)), None),
-                            )
-                            st.success("Feedback saved: this uploaded face is a different person from the selected profile.")
-                        except Exception:
-                            st.error("Could not save evaluation feedback. Check the private app logs for details.")
 
                 with st.expander("Update / Delete existing profile", expanded=True):
                     st.caption(
@@ -1280,15 +1080,6 @@ if uploaded_file is not None and db_engine is not None:
                                     db_engine, selected_profile_id, selected_identity["embedding"],
                                     sample_fingerprint=current_image_fingerprint,
                                     sample_face_index=identity_index,
-                                )
-                                selected_profile_match = next(
-                                    (m for m in matches if int(m["id"]) == int(selected_profile_id)), None
-                                )
-                                record_profile_review(
-                                    db_engine, selected_profile_id, current_image_fingerprint,
-                                    decision="user_confirmed_same_person",
-                                    similarity_score=(selected_profile_match["similarity"] if selected_profile_match else None),
-                                    candidate_rank=next((i + 1 for i, m in enumerate(matches) if int(m["id"]) == int(selected_profile_id)), None),
                                 )
                                 st.session_state["confirmed_profile_id_for_current_image"] = int(selected_profile_id)
                                 st.session_state["confirmed_profile_image_fingerprint"] = current_image_fingerprint
@@ -1349,7 +1140,6 @@ if uploaded_file is not None and db_engine is not None:
                             "then click 'Save analysis to database'."
                         )
 
-            # New profile creation is intentionally placed below the update/delete controls.
             with st.expander("Create a new face profile", expanded=False):
                 with st.form("create_face_profile_form"):
                     new_name = st.text_input("Name (required)", max_chars=100)
@@ -1372,7 +1162,6 @@ if uploaded_file is not None and db_engine is not None:
                                 sample_fingerprint=current_image_fingerprint,
                                 sample_face_index=identity_index,
                             )
-                            record_profile_review(db_engine, profile_id, current_image_fingerprint, "user_created_profile")
                             st.session_state["confirmed_profile_id_for_current_image"] = profile_id
                             st.session_state["confirmed_profile_image_fingerprint"] = current_image_fingerprint
                             st.session_state["confirmed_profile_face_index"] = matched_measurement_index
@@ -1388,84 +1177,6 @@ if uploaded_file is not None and db_engine is not None:
             "are installed and the model can load. Check the private app logs for details."
         )
 
-
-# Human-reviewed matching evaluation. This summarizes labeled comparisons; it is not
-# a statistically valid accuracy estimate unless the test set is representative.
-if db_engine is not None:
-    st.divider()
-    st.subheader("Match Accuracy Evaluation")
-    st.caption(
-        "Review outcomes are human-provided labels, not automatic model training. "
-        "Counts alone are not a true accuracy score unless you evaluate a representative, labeled test set."
-    )
-    try:
-        review_df = load_match_review_data(db_engine)
-        if review_df.empty:
-            st.info("No reviewed match comparisons yet. Confirm same-person matches or mark a selected profile as a different person.")
-        else:
-            labeled = review_df[review_df["decision"].isin([
-                "user_confirmed_same_person", "user_confirmed_different_person"
-            ])].copy()
-            same_count = int((labeled["decision"] == "user_confirmed_same_person").sum())
-            different_count = int((labeled["decision"] == "user_confirmed_different_person").sum())
-            metric_a, metric_b, metric_c = st.columns(3)
-            metric_a.metric("Reviewed comparisons", len(labeled))
-            metric_b.metric("Confirmed same person", same_count)
-            metric_c.metric("Confirmed different person", different_count)
-            if not labeled.empty:
-                st.dataframe(
-                    labeled[["created_at", "profile_name", "decision", "similarity_score", "candidate_rank"]].head(100),
-                    use_container_width=True, hide_index=True
-                )
-            threshold_table = evaluate_reviewed_thresholds(labeled)
-            if not threshold_table.empty:
-                st.markdown("**Candidate threshold evaluation**")
-                st.caption(
-                    "This compares candidate thresholds against your human-reviewed labels. "
-                    "It is only a preliminary estimate: repeated or non-representative examples can bias results. "
-                    "The app does not automatically change its threshold."
-                )
-                current_threshold = get_match_threshold()
-                has_both_classes = (
-                    (labeled["decision"] == "user_confirmed_same_person").sum() >= 3
-                    and (labeled["decision"] == "user_confirmed_different_person").sum() >= 3
-                )
-                if has_both_classes:
-                    usable = threshold_table.dropna(subset=["balanced_accuracy"])
-                    if not usable.empty:
-                        best_row = usable.sort_values(
-                            ["balanced_accuracy", "false_positive", "false_negative"],
-                            ascending=[False, True, True],
-                        ).iloc[0]
-                        st.write(
-                            f"Current configured threshold: **{current_threshold:.2f}**. "
-                            f"Best threshold in this small reviewed sample: **{best_row['threshold']:.2f}** "
-                            f"(balanced accuracy {best_row['balanced_accuracy']:.1%}). "
-                            "Treat this as a starting point, not a validated production setting."
-                        )
-                        st.dataframe(
-                            threshold_table[["threshold", "false_positive", "false_negative", "precision", "recall", "specificity", "balanced_accuracy"]].sort_values("threshold"),
-                            use_container_width=True, hide_index=True,
-                        )
-                        st.caption("To test a candidate setting, add MATCH_THRESHOLD = \"0.50\" (replace 0.50 with your chosen value) to Streamlit Secrets, then redeploy.")
-                else:
-                    st.info(
-                        "Collect at least 3 confirmed-same and 3 confirmed-different comparisons before using the suggested threshold as a rough guide. "
-                        "More diverse, independently collected examples are better."
-                    )
-
-            st.download_button(
-                "Download match evaluation CSV",
-                data=review_df.to_csv(index=False).encode("utf-8-sig"),
-                file_name="face_match_evaluation.csv",
-                mime="text/csv",
-                key="download_match_evaluation_csv",
-            )
-    except Exception:
-        st.warning("Could not load match evaluation data. Check the private app logs for details.")
-
-
-# Keep the accumulated database export independent of the current image analysis.
 if db_engine is not None:
     st.subheader("Accumulated Analysis Data")
     try:
