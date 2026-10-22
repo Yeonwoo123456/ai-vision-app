@@ -619,18 +619,18 @@ def generate_ai_measurement_explanation(measurements, image_width, image_height,
     }
 
     prompt = (
-        "You are the AI Vision Lab saved-profile context assistant. Write ONLY one concise section titled "
-        "'Profile context'. Explain the saved profile's user-provided name, description, and notes, and state "
-        "whether this profile is user-confirmed or only a possible match, based on the provided status. "
-        "Treat all profile text as user-provided information, not verified facts. If there is no saved profile, "
-        "say that no saved profile context is available. If a possible match is provided, include its name, "
-        "description when present, similarity score as a model-specific score (explicitly state it is not a probability), "
-        "and a clear reminder that the user must confirm before linking. If the match is user-confirmed, say so. "
-        "Do NOT include a 'Current measurement summary', "
-        "measurements, numeric landmark values, image dimensions, a 'Limitations' section, caveats section, or "
-        "any other heading. Do not infer identity, age, ethnicity, attractiveness, personality, health, emotion, "
-        "or other personal traits. Do not invent details not present in the profile. Output only the Profile context "
-        "section in concise, plain language.\n\n"
+        "You are the AI Vision Lab saved-profile context formatter. Output exactly these four lines and nothing else, "
+        "with no heading, paragraph, bullets, markdown, or extra explanation:\n"
+        "Name: <saved profile name or Not available>\n"
+        "Description: <user-provided description or Not available>\n"
+        "Note: <user-provided notes or Not available>\n"
+        "Similarity: <model-specific score and match status, or Not available>\n\n"
+        "For a possible match, format Similarity as '<score> (model-specific score, not a probability; confirm before linking)'. "
+        "For a user-confirmed match, format Similarity as '<score if available> (user-confirmed)' or 'User-confirmed; score not available'. "
+        "If no profile is available, use 'Not available' for Name, Description, and Note, and 'No saved profile match' for Similarity. "
+        "Treat all profile text as user-provided information, not verified facts. Preserve the user's wording and do not invent details. "
+        "Do not include measurement summaries, landmark values, image dimensions, limitations, or any other content. "
+        "Do not infer identity or personal traits beyond the provided fields.\n\n"
         "Saved profile context (user-provided metadata):\n"
         + json.dumps(profile_payload, ensure_ascii=False, indent=2)
     )
@@ -657,21 +657,26 @@ def generate_ai_measurement_explanation(measurements, image_width, image_height,
     if not output:
         raise ValueError("Gemini returned an empty profile context. Please try again.")
 
-    # Keep the UI limited to the requested section even if the model adds extra headings.
+    # Normalize to the exact four requested fields, even if Gemini adds extra prose.
     import re
-    output = re.sub(r"(?is)^.*?#+\s*Profile context\s*", "", output, count=1).strip() if re.search(
-        r"(?im)^#+\s*Profile context\s*$", output
-    ) else output
-    for heading in ("Current measurement summary", "Limitations"):
-        match = re.search(rf"(?im)^#+\s*{re.escape(heading)}\s*$", output)
-        if match:
-            output = output[:match.start()].strip()
-    output = re.sub(r"(?im)^#+\s*(Current measurement summary|Limitations)\s*$", "", output).strip()
-    if not output:
-        output = "No saved profile context is available."
-    if not output.lower().startswith("profile context"):
-        output = "### Profile context\n\n" + output
-    return output
+    output = re.sub(r"(?im)^#+\s*Profile context\s*$", "", output).strip()
+    field_values = {}
+    for field in ("Name", "Description", "Note", "Similarity"):
+        match = re.search(rf"(?im)^\s*{field}\s*:\s*(.*?)\s*$", output)
+        field_values[field] = match.group(1).strip() if match else "Not available"
+    if field_values["Similarity"] == "Not available" and profile_payload.get("match_similarity_score") is not None:
+        score = profile_payload["match_similarity_score"]
+        status = str(profile_payload.get("profile_match_status", ""))
+        if "possible" in status.lower():
+            field_values["Similarity"] = f"{score:.3f} (model-specific score, not a probability; confirm before linking)"
+        else:
+            field_values["Similarity"] = f"{score:.3f} (user-confirmed)"
+    if "possible" in str(profile_payload.get("profile_match_status", "")).lower():
+        if field_values["Similarity"] == "Not available":
+            field_values["Similarity"] = "Not available (possible match; confirm before linking)"
+        elif "confirm before linking" not in field_values["Similarity"].lower():
+            field_values["Similarity"] += "; confirm before linking"
+    return "\n\n".join(f"**{field}:** {field_values[field]}" for field in ("Name", "Description", "Note", "Similarity"))
 
 
 st.title("AI Vision Lab")
