@@ -1,5 +1,7 @@
 import base64
+import hashlib
 import io
+import json
 import os
 from datetime import datetime, timezone
 
@@ -60,12 +62,44 @@ def initialize_database(engine):
                 face_width DOUBLE PRECISION,
                 face_height DOUBLE PRECISION,
                 width_height_ratio DOUBLE PRECISION,
-                mouth_gap DOUBLE PRECISION
+                mouth_gap DOUBLE PRECISION,
+                profile_id BIGINT NULL
+            )
+        """))
+        # Safe migration for existing Neon databases created before profile linking.
+        connection.execute(text("ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS profile_id BIGINT NULL"))
+        # Identity profiles are separate from measurement history. Only embeddings and
+        # user-entered profile text are stored; source images are not persisted.
+        connection.execute(text("""
+            CREATE TABLE IF NOT EXISTS face_profiles (
+                id BIGSERIAL PRIMARY KEY,
+                alias TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """))
+        connection.execute(text("""
+            CREATE TABLE IF NOT EXISTS face_profile_embeddings (
+                id BIGSERIAL PRIMARY KEY,
+                profile_id BIGINT NOT NULL REFERENCES face_profiles(id) ON DELETE CASCADE,
+                embedding TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """))
+        connection.execute(text("""
+            CREATE TABLE IF NOT EXISTS face_match_reviews (
+                id BIGSERIAL PRIMARY KEY,
+                profile_id BIGINT NOT NULL REFERENCES face_profiles(id) ON DELETE CASCADE,
+                image_fingerprint TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                created_at TEXT NOT NULL
             )
         """))
 
 
-def save_analysis(engine, face_count, width, height, result):
+def save_analysis(engine, face_count, width, height, result, profile_id=None):
     created_at = datetime.now(timezone.utc).isoformat()
     with engine.begin() as connection:
         connection.execute(
@@ -73,11 +107,11 @@ def save_analysis(engine, face_count, width, height, result):
                 INSERT INTO analysis_history (
                     created_at, face_count, image_width, image_height,
                     face_index, landmark_count, eye_distance, face_width,
-                    face_height, width_height_ratio, mouth_gap
+                    face_height, width_height_ratio, mouth_gap, profile_id
                 ) VALUES (
                     :created_at, :face_count, :image_width, :image_height,
                     :face_index, :landmark_count, :eye_distance, :face_width,
-                    :face_height, :width_height_ratio, :mouth_gap
+                    :face_height, :width_height_ratio, :mouth_gap, :profile_id
                 )
             """),
             {
@@ -86,6 +120,7 @@ def save_analysis(engine, face_count, width, height, result):
                 "image_width": width,
                 "image_height": height,
                 **result,
+                "profile_id": profile_id,
             },
         )
 
@@ -94,13 +129,196 @@ def load_saved_analyses(engine):
     """Load all saved measurement rows so the CSV can accumulate across sessions."""
     with engine.connect() as connection:
         result = connection.execute(text("""
-            SELECT id, created_at, face_count, image_width, image_height,
-                   face_index, landmark_count, eye_distance, face_width,
-                   face_height, width_height_ratio, mouth_gap
-            FROM analysis_history
-            ORDER BY id ASC
+            SELECT h.id, h.created_at, h.face_count, h.image_width, h.image_height,
+                   h.face_index, h.landmark_count, h.eye_distance, h.face_width,
+                   h.face_height, h.width_height_ratio, h.mouth_gap, h.profile_id,
+                   p.alias AS profile_alias
+            FROM analysis_history h
+            LEFT JOIN face_profiles p ON p.id = h.profile_id
+            ORDER BY h.id ASC
         """))
         return pd.DataFrame(result.mappings().all())
+
+
+@st.cache_resource
+def get_face_embedding_model():
+    """Load InsightFace once. It detects faces and creates identity embeddings locally."""
+    from insightface.app import FaceAnalysis
+
+    model = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
+    model.prepare(ctx_id=-1, det_size=(640, 640))
+    return model
+
+
+def get_identity_faces(image_rgb):
+    """Return detected face embeddings from the current image; never saves the image."""
+    image_rgb = validate_image(image_rgb)
+    image_bgr = np.ascontiguousarray(image_rgb[:, :, ::-1])
+    detections = get_face_embedding_model().get(image_bgr)
+    results = []
+    for detected in detections:
+        embedding = np.asarray(detected.embedding, dtype=np.float32)
+        norm = float(np.linalg.norm(embedding))
+        if norm > 0:
+            embedding = embedding / norm
+        results.append({
+            "embedding": embedding,
+            "bbox": [int(round(v)) for v in detected.bbox.tolist()],
+            "det_score": float(getattr(detected, "det_score", 0.0)),
+        })
+    return results
+
+
+def load_face_profiles(engine):
+    with engine.connect() as connection:
+        rows = connection.execute(text("""
+            SELECT p.id, p.alias, p.description, p.notes, e.embedding
+            FROM face_profiles p
+            LEFT JOIN face_profile_embeddings e ON e.profile_id = p.id
+            ORDER BY p.id, e.id
+        """)).mappings().all()
+    profiles = {}
+    for row in rows:
+        profile_id = row["id"]
+        if profile_id not in profiles:
+            profiles[profile_id] = {
+                "id": profile_id,
+                "alias": row["alias"],
+                "description": row["description"] or "",
+                "notes": row["notes"] or "",
+                "embeddings": [],
+            }
+        if row["embedding"]:
+            try:
+                profiles[profile_id]["embeddings"].append(
+                    np.asarray(json.loads(row["embedding"]), dtype=np.float32)
+                )
+            except (ValueError, TypeError, json.JSONDecodeError):
+                continue
+    return list(profiles.values())
+
+
+def create_face_profile(engine, alias, description, notes, embedding):
+    now = datetime.now(timezone.utc).isoformat()
+    normalized = np.asarray(embedding, dtype=np.float32)
+    normalized = normalized / max(float(np.linalg.norm(normalized)), 1e-12)
+    with engine.begin() as connection:
+        profile_id = connection.execute(text("""
+            INSERT INTO face_profiles (alias, description, notes, created_at, updated_at)
+            VALUES (:alias, :description, :notes, :created_at, :updated_at)
+            RETURNING id
+        """), {
+            "alias": alias.strip(), "description": description.strip(), "notes": notes.strip(),
+            "created_at": now, "updated_at": now,
+        }).scalar_one()
+        connection.execute(text("""
+            INSERT INTO face_profile_embeddings (profile_id, embedding, created_at)
+            VALUES (:profile_id, :embedding, :created_at)
+        """), {
+            "profile_id": profile_id,
+            "embedding": json.dumps(normalized.tolist()),
+            "created_at": now,
+        })
+    return profile_id
+
+
+def add_face_profile_sample(engine, profile_id, embedding):
+    now = datetime.now(timezone.utc).isoformat()
+    normalized = np.asarray(embedding, dtype=np.float32)
+    normalized = normalized / max(float(np.linalg.norm(normalized)), 1e-12)
+    with engine.begin() as connection:
+        connection.execute(text("""
+            INSERT INTO face_profile_embeddings (profile_id, embedding, created_at)
+            VALUES (:profile_id, :embedding, :created_at)
+        """), {
+            "profile_id": int(profile_id),
+            "embedding": json.dumps(normalized.tolist()),
+            "created_at": now,
+        })
+        connection.execute(text("""
+            UPDATE face_profiles SET updated_at = :updated_at WHERE id = :profile_id
+        """), {"updated_at": now, "profile_id": int(profile_id)})
+
+
+def delete_face_profile(engine, profile_id):
+    with engine.begin() as connection:
+        # Preserve the accumulated measurement history; remove only its profile link.
+        connection.execute(text("UPDATE analysis_history SET profile_id = NULL WHERE profile_id = :id"), {"id": int(profile_id)})
+        connection.execute(text("DELETE FROM face_match_reviews WHERE profile_id = :id"), {"id": int(profile_id)})
+        connection.execute(text("DELETE FROM face_profiles WHERE id = :id"), {"id": int(profile_id)})
+
+
+def find_face_profile_matches(embedding, profiles):
+    """Rank candidate profiles by cosine similarity; scores are suggestions, not proof."""
+    query = np.asarray(embedding, dtype=np.float32)
+    query = query / max(float(np.linalg.norm(query)), 1e-12)
+    matches = []
+    for profile in profiles:
+        scores = []
+        for sample in profile["embeddings"]:
+            sample = np.asarray(sample, dtype=np.float32)
+            sample = sample / max(float(np.linalg.norm(sample)), 1e-12)
+            if sample.shape == query.shape:
+                scores.append(float(np.dot(query, sample)))
+        if scores:
+            matches.append({**profile, "similarity": max(scores)})
+    return sorted(matches, key=lambda item: item["similarity"], reverse=True)
+
+
+def get_image_fingerprint(uploaded_file):
+    """Ephemeral identifier used to avoid attaching a confirmed profile to another upload."""
+    return hashlib.sha256(uploaded_file.getvalue()).hexdigest()
+
+
+def map_identity_face_to_measurement_face(identity_face, measurement_faces, image_width, image_height):
+    """Map detector outputs by normalized face-box center, not by assumed list ordering."""
+    if not measurement_faces:
+        return None
+    x1, y1, x2, y2 = identity_face["bbox"]
+    target_x = ((x1 + x2) / 2.0) / max(image_width, 1)
+    target_y = ((y1 + y2) / 2.0) / max(image_height, 1)
+    best_index, best_distance = None, float("inf")
+    for i, face in enumerate(measurement_faces):
+        points = face.get("landmarks", [])
+        if not points:
+            continue
+        xs = [float(pt.get("x", 0.0)) for pt in points]
+        ys = [float(pt.get("y", 0.0)) for pt in points]
+        center_x = (min(xs) + max(xs)) / 2.0
+        center_y = (min(ys) + max(ys)) / 2.0
+        distance = float(np.hypot(target_x - center_x, target_y - center_y))
+        if distance < best_distance:
+            best_index, best_distance = i, distance
+    # Avoid linking records if the two detectors' face locations disagree substantially.
+    return best_index if best_index is not None and best_distance <= 0.18 else None
+
+
+def record_profile_review(engine, profile_id, image_fingerprint, decision="user_confirmed_same_person"):
+    with engine.begin() as connection:
+        connection.execute(text("""
+            INSERT INTO face_match_reviews (profile_id, image_fingerprint, decision, created_at)
+            VALUES (:profile_id, :image_fingerprint, :decision, :created_at)
+        """), {
+            "profile_id": int(profile_id),
+            "image_fingerprint": image_fingerprint,
+            "decision": decision,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+
+def load_profile_analyses(engine, profile_id):
+    with engine.connect() as connection:
+        rows = connection.execute(text("""
+            SELECT h.id, h.created_at, h.face_count, h.image_width, h.image_height,
+                   h.face_index, h.landmark_count, h.eye_distance, h.face_width,
+                   h.face_height, h.width_height_ratio, h.mouth_gap,
+                   h.profile_id, p.alias AS profile_alias
+            FROM analysis_history h
+            JOIN face_profiles p ON p.id = h.profile_id
+            WHERE h.profile_id = :profile_id
+            ORDER BY h.id ASC
+        """), {"profile_id": int(profile_id)}).mappings().all()
+    return pd.DataFrame(rows)
 
 
 def load_image(uploaded_file):
@@ -324,15 +542,15 @@ def get_gemini_settings():
     """Read Gemini credentials from Streamlit Secrets or environment variables."""
     try:
         api_key = st.secrets.get("GEMINI_API_KEY", "")
-        model = st.secrets.get("GEMINI_MODEL", "gemini-3.8-flash")
+        model = st.secrets.get("GEMINI_MODEL", "gemini-2.5-flash")
     except Exception:
         api_key = ""
-        model = "gemini-3.8-flash"
+        model = "gemini-2.5-flash"
 
     if not api_key:
         api_key = os.environ.get("GEMINI_API_KEY", "")
     if not model:
-        model = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+        model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
     return api_key, model
 
 
@@ -432,6 +650,13 @@ if db_engine is None:
 if uploaded_file is not None:
     try:
         original = load_image(uploaded_file)
+        current_image_fingerprint = get_image_fingerprint(uploaded_file)
+
+        # A profile confirmation is valid only for the exact current upload.
+        if st.session_state.get("confirmed_profile_image_fingerprint") != current_image_fingerprint:
+            st.session_state.pop("confirmed_profile_id_for_current_image", None)
+            st.session_state.pop("confirmed_profile_face_index", None)
+            st.session_state.pop("confirmed_profile_identity_index", None)
 
         with st.spinner("Analyzing image..."):
             annotated, faces = detect_faces(original)
@@ -530,17 +755,189 @@ if uploaded_file is not None:
                 )
             else:
                 try:
-                    for result in analyses:
+                    confirmed_profile_id = st.session_state.get("confirmed_profile_id_for_current_image")
+                    confirmed_face_index = st.session_state.get("confirmed_profile_face_index")
+                    confirmed_identity_index = st.session_state.get("confirmed_profile_identity_index")
+                    active_identity_index = st.session_state.get("identity_face_select")
+                    # A confirmation only applies to the exact upload and selected face.
+                    if confirmed_identity_index != active_identity_index:
+                        confirmed_profile_id = None
+                        confirmed_face_index = None
+                    linked_rows = 0
+                    for index, result in enumerate(analyses):
+                        row_profile_id = (
+                            confirmed_profile_id
+                            if confirmed_profile_id is not None and index == confirmed_face_index
+                            else None
+                        )
                         save_analysis(
                             db_engine,
                             len(faces),
                             original.shape[1],
                             original.shape[0],
                             result,
+                            profile_id=row_profile_id,
                         )
-                    st.success("Analysis summary saved to database.")
+                        if row_profile_id is not None:
+                            linked_rows += 1
+                    if linked_rows:
+                        st.success(f"Analysis saved. {linked_rows} face record linked to the confirmed profile.")
+                    else:
+                        st.success("Analysis saved. No profile was linked because no same-person match was confirmed for this image.")
                 except Exception as exc:
                     st.error(f"Unable to save analysis: {exc}")
+
+
+# Same-person profile matching is an opt-in, separate feature. The raw image is processed
+# locally; only the numeric embedding and user-entered alias/description/notes are persisted.
+if uploaded_file is not None and db_engine is not None:
+    st.divider()
+    st.subheader("Face Identity Profiles")
+    st.caption(
+        "Use only photos you have permission to process. Matches are suggestions, not proof of identity. "
+        "The source image is not saved; profile embeddings and your notes are stored in Neon."
+    )
+    try:
+        with st.spinner("Creating local face embeddings..."):
+            identity_faces = get_identity_faces(original)
+        profiles = load_face_profiles(db_engine)
+
+        if not identity_faces:
+            st.info("The identity model did not detect a face in this image.")
+        else:
+            identity_index = st.selectbox(
+                "Select face for profile matching",
+                range(len(identity_faces)),
+                format_func=lambda i: f"Detected face {i + 1}",
+                key="identity_face_select",
+            )
+            selected_identity = identity_faces[identity_index]
+            matched_measurement_index = map_identity_face_to_measurement_face(
+                selected_identity, faces, original.shape[1], original.shape[0]
+            )
+            matches = find_face_profile_matches(selected_identity["embedding"], profiles)
+            # Conservative initial threshold; should be calibrated with consented test images.
+            candidate = matches[0] if matches and matches[0]["similarity"] >= 0.45 else None
+
+            if candidate:
+                st.markdown("**Possible saved profile**")
+                st.write(f"Alias: {candidate['alias']}")
+                if candidate["description"]:
+                    st.write(f"Description: {candidate['description']}")
+                if candidate["notes"]:
+                    st.write(f"Notes: {candidate['notes']}")
+                st.caption(
+                    f"Similarity score: {candidate['similarity']:.3f}. "
+                    "This score is model-specific and must not be treated as a probability. Confirm the match before linking this sample."
+                )
+            elif matches:
+                st.info("No strong candidate reached the initial matching threshold. You can review the closest candidates below.")
+                for match in matches[:3]:
+                    st.write(f"{match['alias']} — similarity {match['similarity']:.3f}")
+            else:
+                st.info("No saved face profiles yet. Create a profile below to start your private gallery.")
+
+            with st.expander("Create a new face profile", expanded=not bool(candidate)):
+                with st.form("create_face_profile_form"):
+                    new_alias = st.text_input("Alias (required)", max_chars=100)
+                    new_description = st.text_area("Description", max_chars=1000)
+                    new_notes = st.text_area("Notes", max_chars=3000)
+                    confirm_save = st.checkbox("I have permission to save and compare this face sample.")
+                    create_submitted = st.form_submit_button("Save new face profile")
+                if create_submitted:
+                    if not new_alias.strip():
+                        st.error("Enter an alias before saving.")
+                    elif not confirm_save:
+                        st.error("Confirm that you have permission to process this face sample.")
+                    else:
+                        try:
+                            profile_id = create_face_profile(
+                                db_engine, new_alias, new_description, new_notes,
+                                selected_identity["embedding"],
+                            )
+                            record_profile_review(db_engine, profile_id, current_image_fingerprint, "user_created_profile")
+                            st.session_state["confirmed_profile_id_for_current_image"] = profile_id
+                            st.session_state["confirmed_profile_image_fingerprint"] = current_image_fingerprint
+                            st.session_state["confirmed_profile_face_index"] = matched_measurement_index
+                            st.session_state["confirmed_profile_identity_index"] = identity_index
+                            st.success(f"Profile '{new_alias.strip()}' saved (ID {profile_id}).")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Could not save face profile: {exc}")
+
+            if profiles:
+                st.markdown("**Manage existing profiles**")
+                profile_by_id = {profile["id"]: profile for profile in profiles}
+                selected_profile_id = st.selectbox(
+                    "Choose profile to add this face sample to",
+                    list(profile_by_id.keys()),
+                    format_func=lambda profile_id: profile_by_id[profile_id]["alias"],
+                    key="profile_sample_target",
+                )
+                confirm_link = st.checkbox(
+                    "I reviewed the candidate and confirm this sample belongs to the selected profile.",
+                    key="confirm_profile_link",
+                )
+                if st.button("Add face sample to selected profile", key="add_face_profile_sample"):
+                    if not confirm_link:
+                        st.error("Confirm the match before adding a sample.")
+                    else:
+                        try:
+                            add_face_profile_sample(
+                                db_engine, selected_profile_id, selected_identity["embedding"]
+                            )
+                            record_profile_review(db_engine, selected_profile_id, current_image_fingerprint)
+                            st.session_state["confirmed_profile_id_for_current_image"] = int(selected_profile_id)
+                            st.session_state["confirmed_profile_image_fingerprint"] = current_image_fingerprint
+                            st.session_state["confirmed_profile_face_index"] = matched_measurement_index
+                            st.session_state["confirmed_profile_identity_index"] = identity_index
+                            if matched_measurement_index is None:
+                                st.warning("The identity detector and landmark detector could not confidently map this face to a measurement row. The embedding was saved, but this image's measurement row will not be linked to the profile.")
+                            else:
+                                st.success("Confirmed sample added. Save analysis to database to link this image's measurement record to the profile.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Could not add face sample: {exc}")
+
+                st.markdown("**Export this profile's accumulated analysis CSV**")
+                profile_rows = load_profile_analyses(db_engine, selected_profile_id)
+                if not profile_rows.empty:
+                    st.download_button(
+                        "Download selected profile CSV",
+                        data=profile_rows.to_csv(index=False).encode("utf-8-sig"),
+                        file_name=f"face_profile_{selected_profile_id}_analysis.csv",
+                        mime="text/csv",
+                        key="download_profile_csv",
+                    )
+                else:
+                    st.caption("No analysis records have been linked to this profile yet. Confirm a face sample, then click 'Save analysis to database'.")
+
+                st.markdown("**Delete a profile**")
+                delete_profile_id = st.selectbox(
+                    "Choose profile to delete",
+                    list(profile_by_id.keys()),
+                    format_func=lambda profile_id: profile_by_id[profile_id]["alias"],
+                    key="delete_profile_target",
+                )
+                confirm_delete = st.checkbox(
+                    "I understand this permanently deletes the selected profile and its saved embeddings.",
+                    key="confirm_delete_profile",
+                )
+                if st.button("Delete selected face profile", key="delete_face_profile"):
+                    if not confirm_delete:
+                        st.error("Confirm deletion first.")
+                    else:
+                        try:
+                            delete_face_profile(db_engine, delete_profile_id)
+                            st.success("Face profile deleted.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Could not delete face profile: {exc}")
+    except Exception as exc:
+        st.warning(
+            "Face profile matching is unavailable. Confirm that insightface and onnxruntime "
+            f"are installed and the model can load. Details: {exc}"
+        )
 
 
 # Keep the accumulated database export independent of the current image analysis.
@@ -554,7 +951,7 @@ if db_engine is not None:
                 data=saved_rows.to_csv(index=False).encode("utf-8-sig"),
                 file_name="analysis_history.csv",
                 mime="text/csv",
-                help="Downloads all analyses previously saved to the database.",
+                help="Downloads all saved analysis records, including confirmed profile ID and alias when linked.",
                 key="download_accumulated_analysis_csv",
             )
         else:
