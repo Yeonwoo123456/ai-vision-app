@@ -99,9 +99,14 @@ def initialize_database(engine):
                 profile_id BIGINT NOT NULL REFERENCES face_profiles(id) ON DELETE CASCADE,
                 image_fingerprint TEXT NOT NULL,
                 decision TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                similarity_score DOUBLE PRECISION NULL,
+                candidate_rank INTEGER NULL
             )
         """))
+        # Safe migration for review records created by earlier app versions.
+        connection.execute(text("ALTER TABLE face_match_reviews ADD COLUMN IF NOT EXISTS similarity_score DOUBLE PRECISION NULL"))
+        connection.execute(text("ALTER TABLE face_match_reviews ADD COLUMN IF NOT EXISTS candidate_rank INTEGER NULL"))
 
 
 def save_analysis(engine, face_count, width, height, result, profile_id=None):
@@ -155,8 +160,103 @@ def get_face_embedding_model():
     return model
 
 
+def assess_face_quality(image_rgb, bbox, det_score, keypoints=None):
+    """Estimate input quality from face size, detector confidence, blur and pose cues.
+
+    These are screening heuristics, not a guarantee that a face match is correct.
+    The source image is processed in memory and is not persisted by this function.
+    """
+    import cv2
+
+    height, width = image_rgb.shape[:2]
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+    x1, x2 = max(0, x1), min(width, x2)
+    y1, y2 = max(0, y1), min(height, y2)
+    face_width = max(0, x2 - x1)
+    face_height = max(0, y2 - y1)
+    crop = image_rgb[y1:y2, x1:x2]
+    blur_score = 0.0
+    if crop.size and crop.shape[0] >= 2 and crop.shape[1] >= 2:
+        gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+        blur_score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    warnings = []
+    gray_crop = None
+    brightness_mean = None
+    brightness_std = None
+    if crop.size and crop.shape[0] >= 2 and crop.shape[1] >= 2:
+        gray_crop = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+        brightness_mean = float(np.mean(gray_crop))
+        brightness_std = float(np.std(gray_crop))
+
+    # Face size relative to the full image helps detect distant/tiny face crops.
+    face_area_ratio = float((face_width * face_height) / max(width * height, 1))
+    if min(face_width, face_height) < 90 or face_area_ratio < 0.012:
+        warnings.append("Face is small in the image; use a closer, higher-resolution photo.")
+    if float(det_score) < 0.60:
+        warnings.append("Face detection confidence is low; try a clearer photo.")
+    if blur_score < 25.0:
+        warnings.append("The face may be blurry; use a sharper image.")
+    if brightness_mean is not None and brightness_mean < 45:
+        warnings.append("The face crop is very dark; use more even lighting.")
+    elif brightness_mean is not None and brightness_mean > 215:
+        warnings.append("The face crop may be overexposed; reduce strong lighting or glare.")
+    if brightness_std is not None and brightness_std < 18:
+        warnings.append("The face crop has very little contrast; use a clearer photo with balanced lighting.")
+
+    # Approximate pose cues from InsightFace's five keypoints (eyes, nose, mouth corners).
+    # These are screening heuristics, not precise pose estimates.
+    pose_offset = None
+    eye_roll_degrees = None
+    if keypoints is not None:
+        try:
+            pts = np.asarray(keypoints, dtype=np.float32)
+            if pts.shape[0] >= 3:
+                eye_delta = pts[1] - pts[0]
+                eye_distance = float(np.linalg.norm(eye_delta))
+                eye_mid = (pts[0] + pts[1]) / 2.0
+                if eye_distance > 1e-6:
+                    pose_offset = float(abs(pts[2][0] - eye_mid[0]) / eye_distance)
+                    raw_eye_angle = abs(float(np.degrees(np.arctan2(eye_delta[1], eye_delta[0]))))
+                    # Eye keypoint order can run either left-to-right or right-to-left.
+                    # Normalize orientation so a horizontal eye line is close to 0 degrees.
+                    eye_roll_degrees = min(raw_eye_angle, abs(180.0 - raw_eye_angle))
+                    if pose_offset > 0.22:
+                        warnings.append("The face may be turned to the side; a more front-facing photo may match better.")
+                    if eye_roll_degrees > 15:
+                        warnings.append("The head appears tilted; a more level photo may improve matching.")
+        except (TypeError, ValueError, IndexError):
+            pose_offset = None
+            eye_roll_degrees = None
+
+    # A conservative quality gate. Warnings can appear before a hard block; quality is
+    # only a photo-screening signal and does not establish identity.
+    quality_ok = (
+        min(face_width, face_height) >= 80
+        and face_area_ratio >= 0.008
+        and float(det_score) >= 0.45
+        and blur_score >= 12.0
+        and (brightness_mean is None or 25 <= brightness_mean <= 235)
+        and (pose_offset is None or pose_offset <= 0.40)
+        and (eye_roll_degrees is None or eye_roll_degrees <= 30)
+    )
+    return {
+        "face_width_px": face_width,
+        "face_height_px": face_height,
+        "face_area_ratio": face_area_ratio,
+        "det_score": float(det_score),
+        "blur_score": blur_score,
+        "brightness_mean": brightness_mean,
+        "brightness_std": brightness_std,
+        "pose_offset": pose_offset,
+        "eye_roll_degrees": eye_roll_degrees,
+        "quality_ok": quality_ok,
+        "warnings": warnings,
+    }
+
+
 def get_identity_faces(image_rgb):
-    """Return detected face embeddings from the current image; never saves the image."""
+    """Return local face embeddings and quality metadata; never saves the source image."""
     image_rgb = validate_image(image_rgb)
     image_bgr = np.ascontiguousarray(image_rgb[:, :, ::-1])
     detections = get_face_embedding_model().get(image_bgr)
@@ -166,10 +266,15 @@ def get_identity_faces(image_rgb):
         norm = float(np.linalg.norm(embedding))
         if norm > 0:
             embedding = embedding / norm
+        bbox = [int(round(v)) for v in detected.bbox.tolist()]
+        det_score = float(getattr(detected, "det_score", 0.0))
+        keypoints = getattr(detected, "kps", None)
+        quality = assess_face_quality(image_rgb, bbox, det_score, keypoints)
         results.append({
             "embedding": embedding,
-            "bbox": [int(round(v)) for v in detected.bbox.tolist()],
-            "det_score": float(getattr(detected, "det_score", 0.0)),
+            "bbox": bbox,
+            "det_score": det_score,
+            "quality": quality,
         })
     return results
 
@@ -296,7 +401,11 @@ def delete_face_profile(engine, profile_id):
 
 
 def find_face_profile_matches(embedding, profiles):
-    """Rank candidate profiles by cosine similarity; scores are suggestions, not proof."""
+    """Rank profiles against multiple saved samples, not just a single best sample.
+
+    The aggregate is a heuristic score, not an identity probability. Thresholds must be
+    calibrated using consented, representative test photos before production use.
+    """
     query = np.asarray(embedding, dtype=np.float32)
     query = query / max(float(np.linalg.norm(query)), 1e-12)
     matches = []
@@ -308,7 +417,19 @@ def find_face_profile_matches(embedding, profiles):
             if sample.shape == query.shape:
                 scores.append(float(np.dot(query, sample)))
         if scores:
-            matches.append({**profile, "similarity": max(scores)})
+            scores.sort(reverse=True)
+            top_scores = scores[:min(3, len(scores))]
+            best_score = top_scores[0]
+            top_mean = float(np.mean(top_scores))
+            # Blend best match with consistency across the closest few samples.
+            aggregate_score = 0.65 * best_score + 0.35 * top_mean
+            matches.append({
+                **profile,
+                "similarity": float(aggregate_score),
+                "best_sample_similarity": float(best_score),
+                "samples_compared": len(scores),
+                "top_sample_mean": top_mean,
+            })
     return sorted(matches, key=lambda item: item["similarity"], reverse=True)
 
 
@@ -340,17 +461,90 @@ def map_identity_face_to_measurement_face(identity_face, measurement_faces, imag
     return best_index if best_index is not None and best_distance <= 0.18 else None
 
 
-def record_profile_review(engine, profile_id, image_fingerprint, decision="user_confirmed_same_person"):
+def record_profile_review(
+    engine, profile_id, image_fingerprint, decision="user_confirmed_same_person",
+    similarity_score=None, candidate_rank=None,
+):
+    """Store a human-reviewed match label for later evaluation; not model training."""
     with engine.begin() as connection:
         connection.execute(text("""
-            INSERT INTO face_match_reviews (profile_id, image_fingerprint, decision, created_at)
-            VALUES (:profile_id, :image_fingerprint, :decision, :created_at)
+            INSERT INTO face_match_reviews (
+                profile_id, image_fingerprint, decision, created_at, similarity_score, candidate_rank
+            ) VALUES (
+                :profile_id, :image_fingerprint, :decision, :created_at, :similarity_score, :candidate_rank
+            )
         """), {
             "profile_id": int(profile_id),
             "image_fingerprint": image_fingerprint,
             "decision": decision,
             "created_at": datetime.now(timezone.utc).isoformat(),
+            "similarity_score": float(similarity_score) if similarity_score is not None else None,
+            "candidate_rank": int(candidate_rank) if candidate_rank is not None else None,
         })
+
+
+def load_match_review_data(engine):
+    """Load user-labeled match outcomes for evaluation and CSV export."""
+    with engine.connect() as connection:
+        rows = connection.execute(text("""
+            SELECT r.id, r.created_at, r.profile_id,
+                   COALESCE(NULLIF(p.name, ''), p.alias, '[deleted profile]') AS profile_name,
+                   r.decision, r.similarity_score, r.candidate_rank, r.image_fingerprint
+            FROM face_match_reviews r
+            LEFT JOIN face_profiles p ON p.id = r.profile_id
+            ORDER BY r.id DESC
+        """)).mappings().all()
+    return pd.DataFrame(rows)
+
+
+def get_match_threshold():
+    """Read the candidate threshold from Streamlit Secrets/env; default is a placeholder."""
+    raw_value = None
+    try:
+        raw_value = st.secrets.get("MATCH_THRESHOLD", None)
+    except Exception:
+        raw_value = None
+    if raw_value is None or raw_value == "":
+        raw_value = os.environ.get("MATCH_THRESHOLD", "0.45")
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        value = 0.45
+    return min(0.99, max(0.01, value))
+
+
+def evaluate_reviewed_thresholds(review_df):
+    """Evaluate candidate thresholds against human-labeled comparisons only."""
+    if review_df is None or review_df.empty or "similarity_score" not in review_df.columns:
+        return pd.DataFrame()
+    labeled = review_df[review_df["decision"].isin([
+        "user_confirmed_same_person", "user_confirmed_different_person"
+    ])].copy()
+    labeled["similarity_score"] = pd.to_numeric(labeled["similarity_score"], errors="coerce")
+    labeled = labeled.dropna(subset=["similarity_score"])
+    if labeled.empty:
+        return pd.DataFrame()
+    actual_same = (labeled["decision"] == "user_confirmed_same_person").to_numpy(dtype=bool)
+    scores = labeled["similarity_score"].to_numpy(dtype=float)
+    rows = []
+    for threshold in np.round(np.arange(0.30, 0.851, 0.01), 2):
+        predicted_same = scores >= threshold
+        tp = int(np.sum(predicted_same & actual_same))
+        fp = int(np.sum(predicted_same & ~actual_same))
+        tn = int(np.sum(~predicted_same & ~actual_same))
+        fn = int(np.sum(~predicted_same & actual_same))
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        recall = tp / (tp + fn) if tp + fn else 0.0
+        specificity = tn / (tn + fp) if tn + fp else 0.0
+        balanced_accuracy = (recall + specificity) / 2 if (tp + fn) and (tn + fp) else None
+        rows.append({
+            "threshold": float(threshold), "true_positive": tp, "false_positive": fp,
+            "true_negative": tn, "false_negative": fn, "precision": precision,
+            "recall": recall, "specificity": specificity,
+            "balanced_accuracy": balanced_accuracy,
+            "labeled_comparisons": int(len(scores)),
+        })
+    return pd.DataFrame(rows)
 
 
 def load_profile_analyses(engine, profile_id):
@@ -803,7 +997,7 @@ if uploaded_file is not None:
                             if mapped_index == selected_index:
                                 matched_identity = identity_face
                                 break
-                        if matched_identity is not None:
+                        if matched_identity is not None and matched_identity.get("quality", {}).get("quality_ok", False):
                             confirmed_profile_id = st.session_state.get("confirmed_profile_id_for_current_image")
                             confirmed_profile_fingerprint = st.session_state.get("confirmed_profile_image_fingerprint")
                             confirmed_measurement_index = st.session_state.get("confirmed_profile_face_index")
@@ -835,7 +1029,7 @@ if uploaded_file is not None:
                                 )
                                 if profile_matches_for_ai:
                                     top_profile = profile_matches_for_ai[0]
-                                    if top_profile["similarity"] >= 0.45:
+                                    if top_profile["similarity"] >= get_match_threshold():
                                         profile_context = {
                                             "name": top_profile["name"],
                                             "description": top_profile["description"],
@@ -847,6 +1041,8 @@ if uploaded_file is not None:
                                         profile_context = {"no_match": True, "status": "no saved profile match"}
                                 else:
                                     profile_context = {"no_match": True, "status": "no saved profile match"}
+                        elif matched_identity is not None:
+                            profile_context = {"no_match": True, "status": "low quality image; request clearer photo"}
                     explanation = generate_ai_measurement_explanation(
                         selected, original.shape[1], original.shape[0], profile_context
                     )
@@ -967,11 +1163,34 @@ if uploaded_file is not None and db_engine is not None:
             matched_measurement_index = map_identity_face_to_measurement_face(
                 selected_identity, faces, original.shape[1], original.shape[0]
             )
-            matches = find_face_profile_matches(selected_identity["embedding"], profiles)
-            # Conservative initial threshold; should be calibrated with consented test images.
-            candidate = matches[0] if matches and matches[0]["similarity"] >= 0.45 else None
+            quality = selected_identity.get("quality", {})
+            if quality.get("warnings"):
+                st.warning("Face photo quality check: " + " ".join(quality["warnings"]))
+            else:
+                st.success("Face photo quality checks passed. Matching can still be uncertain.")
+            with st.expander("Photo quality details", expanded=False):
+                q1, q2, q3 = st.columns(3)
+                q1.metric("Face crop", f'{quality.get("face_width_px", 0)} × {quality.get("face_height_px", 0)} px')
+                q2.metric("Detection score", f'{quality.get("det_score", 0.0):.3f}')
+                q3.metric("Blur score", f'{quality.get("blur_score", 0.0):.1f}')
+                q4, q5, q6 = st.columns(3)
+                brightness = quality.get("brightness_mean")
+                q4.metric("Mean brightness", f"{brightness:.1f}/255" if brightness is not None else "N/A")
+                q5.metric("Face image area", f'{quality.get("face_area_ratio", 0.0) * 100:.1f}%')
+                roll = quality.get("eye_roll_degrees")
+                q6.metric("Estimated head tilt", f"{roll:.1f}°" if roll is not None else "N/A")
+                st.caption("These are heuristic image-quality indicators, not identity-confidence scores or precise pose measurements.")
 
+            matches = find_face_profile_matches(selected_identity["embedding"], profiles) if quality.get("quality_ok") else []
             # Candidate profile details are intentionally hidden in this section.
+            # Low-quality images are not ranked; ask for a clearer, more frontal photo.
+            match_threshold = get_match_threshold()
+            candidate = matches[0] if matches and matches[0]["similarity"] >= match_threshold else None
+            if not quality.get("quality_ok"):
+                st.info("Profile matching is paused for this image because quality is below the minimum screening threshold. Upload a clearer, larger, sharper, more front-facing photo.")
+            elif profiles and not candidate:
+                st.caption(f"No profile reached the current candidate threshold ({match_threshold:.2f}). This does not prove the person is new.")
+
             # They are shown only inside AI Explanation after the user requests it.
 
             if profiles:
@@ -984,6 +1203,30 @@ if uploaded_file is not None and db_engine is not None:
                     key="profile_sample_target",
                 )
                 selected_profile = profile_by_id[selected_profile_id]
+
+                # Explicit negative feedback helps measure false-match behavior.
+                # It does not delete or modify the selected profile.
+                st.caption("Accuracy feedback: use this only after reviewing the selected profile against the uploaded face.")
+                if st.button(
+                    "Mark selected profile as a different person",
+                    key="mark_selected_profile_different_person",
+                ):
+                    if not quality.get("quality_ok", False):
+                        st.error("The image quality is too low to label this comparison reliably.")
+                    else:
+                        selected_profile_match = next(
+                            (m for m in matches if int(m["id"]) == int(selected_profile_id)), None
+                        )
+                        try:
+                            record_profile_review(
+                                db_engine, selected_profile_id, current_image_fingerprint,
+                                decision="user_confirmed_different_person",
+                                similarity_score=(selected_profile_match["similarity"] if selected_profile_match else None),
+                                candidate_rank=next((i + 1 for i, m in enumerate(matches) if int(m["id"]) == int(selected_profile_id)), None),
+                            )
+                            st.success("Feedback saved: this uploaded face is a different person from the selected profile.")
+                        except Exception as exc:
+                            st.error(f"Could not save evaluation feedback: {exc}")
 
                 with st.expander("Update / Delete existing profile", expanded=True):
                     st.caption(
@@ -1015,7 +1258,9 @@ if uploaded_file is not None and db_engine is not None:
                         )
 
                     if update_profile_submitted:
-                        if not confirm_link:
+                        if not selected_identity.get("quality", {}).get("quality_ok", False):
+                            st.error("This photo did not pass the minimum quality check. Upload a clearer photo before adding it to a profile.")
+                        elif not confirm_link:
                             st.error("Please confirm the same-person match before updating the profile.")
                         else:
                             try:
@@ -1029,7 +1274,15 @@ if uploaded_file is not None and db_engine is not None:
                                 add_face_profile_sample(
                                     db_engine, selected_profile_id, selected_identity["embedding"]
                                 )
-                                record_profile_review(db_engine, selected_profile_id, current_image_fingerprint)
+                                selected_profile_match = next(
+                                    (m for m in matches if int(m["id"]) == int(selected_profile_id)), None
+                                )
+                                record_profile_review(
+                                    db_engine, selected_profile_id, current_image_fingerprint,
+                                    decision="user_confirmed_same_person",
+                                    similarity_score=(selected_profile_match["similarity"] if selected_profile_match else None),
+                                    candidate_rank=next((i + 1 for i, m in enumerate(matches) if int(m["id"]) == int(selected_profile_id)), None),
+                                )
                                 st.session_state["confirmed_profile_id_for_current_image"] = int(selected_profile_id)
                                 st.session_state["confirmed_profile_image_fingerprint"] = current_image_fingerprint
                                 st.session_state["confirmed_profile_face_index"] = matched_measurement_index
@@ -1098,7 +1351,9 @@ if uploaded_file is not None and db_engine is not None:
                     confirm_save = st.checkbox("I have permission to save and compare this face sample.")
                     create_submitted = st.form_submit_button("Save new face profile")
                 if create_submitted:
-                    if not new_name.strip():
+                    if not selected_identity.get("quality", {}).get("quality_ok", False):
+                        st.error("This photo did not pass the minimum quality check. Upload a clearer photo before creating a profile.")
+                    elif not new_name.strip():
                         st.error("Enter a name before saving.")
                     elif not confirm_save:
                         st.error("Confirm that you have permission to process this face sample.")
@@ -1123,6 +1378,82 @@ if uploaded_file is not None and db_engine is not None:
             "Face profile matching is unavailable. Confirm that insightface and onnxruntime "
             f"are installed and the model can load. Details: {exc}"
         )
+
+
+# Human-reviewed matching evaluation. This summarizes labeled comparisons; it is not
+# a statistically valid accuracy estimate unless the test set is representative.
+if db_engine is not None:
+    st.divider()
+    st.subheader("Match Accuracy Evaluation")
+    st.caption(
+        "Review outcomes are human-provided labels, not automatic model training. "
+        "Counts alone are not a true accuracy score unless you evaluate a representative, labeled test set."
+    )
+    try:
+        review_df = load_match_review_data(db_engine)
+        if review_df.empty:
+            st.info("No reviewed match comparisons yet. Confirm same-person matches or mark a selected profile as a different person.")
+        else:
+            labeled = review_df[review_df["decision"].isin([
+                "user_confirmed_same_person", "user_confirmed_different_person"
+            ])].copy()
+            same_count = int((labeled["decision"] == "user_confirmed_same_person").sum())
+            different_count = int((labeled["decision"] == "user_confirmed_different_person").sum())
+            metric_a, metric_b, metric_c = st.columns(3)
+            metric_a.metric("Reviewed comparisons", len(labeled))
+            metric_b.metric("Confirmed same person", same_count)
+            metric_c.metric("Confirmed different person", different_count)
+            if not labeled.empty:
+                st.dataframe(
+                    labeled[["created_at", "profile_name", "decision", "similarity_score", "candidate_rank"]].head(100),
+                    use_container_width=True, hide_index=True
+                )
+            threshold_table = evaluate_reviewed_thresholds(labeled)
+            if not threshold_table.empty:
+                st.markdown("**Candidate threshold evaluation**")
+                st.caption(
+                    "This compares candidate thresholds against your human-reviewed labels. "
+                    "It is only a preliminary estimate: repeated or non-representative examples can bias results. "
+                    "The app does not automatically change its threshold."
+                )
+                current_threshold = get_match_threshold()
+                has_both_classes = (
+                    (labeled["decision"] == "user_confirmed_same_person").sum() >= 3
+                    and (labeled["decision"] == "user_confirmed_different_person").sum() >= 3
+                )
+                if has_both_classes:
+                    usable = threshold_table.dropna(subset=["balanced_accuracy"])
+                    if not usable.empty:
+                        best_row = usable.sort_values(
+                            ["balanced_accuracy", "false_positive", "false_negative"],
+                            ascending=[False, True, True],
+                        ).iloc[0]
+                        st.write(
+                            f"Current configured threshold: **{current_threshold:.2f}**. "
+                            f"Best threshold in this small reviewed sample: **{best_row['threshold']:.2f}** "
+                            f"(balanced accuracy {best_row['balanced_accuracy']:.1%}). "
+                            "Treat this as a starting point, not a validated production setting."
+                        )
+                        st.dataframe(
+                            threshold_table[["threshold", "false_positive", "false_negative", "precision", "recall", "specificity", "balanced_accuracy"]].sort_values("threshold"),
+                            use_container_width=True, hide_index=True,
+                        )
+                        st.caption("To test a candidate setting, add MATCH_THRESHOLD = \"0.50\" (replace 0.50 with your chosen value) to Streamlit Secrets, then redeploy.")
+                else:
+                    st.info(
+                        "Collect at least 3 confirmed-same and 3 confirmed-different comparisons before using the suggested threshold as a rough guide. "
+                        "More diverse, independently collected examples are better."
+                    )
+
+            st.download_button(
+                "Download match evaluation CSV",
+                data=review_df.to_csv(index=False).encode("utf-8-sig"),
+                file_name="face_match_evaluation.csv",
+                mime="text/csv",
+                key="download_match_evaluation_csv",
+            )
+    except Exception as exc:
+        st.warning(f"Could not load match evaluation data: {exc}")
 
 
 # Keep the accumulated database export independent of the current image analysis.
