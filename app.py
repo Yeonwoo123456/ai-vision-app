@@ -1,6 +1,10 @@
+app.py
 import hashlib
+import heapq
 import io
+import itertools
 import json
+import math
 import os
 from datetime import datetime, timezone
 
@@ -10,7 +14,6 @@ import streamlit as st
 from PIL import Image, ImageOps
 from sqlalchemy import create_engine, text
 from detector import detect_faces
-from search_algorithms import astar_landmark_path
 from ui import configure_page, render_header, render_sidebar, show_image
 
 configure_page()
@@ -57,9 +60,9 @@ def initialize_database(engine):
                 profile_id BIGINT NULL
             )
         """))
-                                                                                    
+
         connection.execute(text("ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS profile_id BIGINT NULL"))
-                                                                                                 
+
         connection.execute(text("ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS image_fingerprint TEXT NULL"))
         connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_analysis_image_face ON analysis_history (image_fingerprint, face_index) WHERE image_fingerprint IS NOT NULL"))
 
@@ -74,7 +77,7 @@ def initialize_database(engine):
                 updated_at TEXT NOT NULL
             )
         """))
-                                                                                   
+
         connection.execute(text("ALTER TABLE face_profiles ADD COLUMN IF NOT EXISTS name TEXT"))
         connection.execute(text("UPDATE face_profiles SET name = alias WHERE name IS NULL OR name = ''"))
         connection.execute(text("""
@@ -270,7 +273,7 @@ def load_face_profiles(engine):
                 vector = normalize_embedding(json.loads(row["embedding"]))
                 profiles[profile_id]["embeddings"].append(vector)
             except (ValueError, TypeError, json.JSONDecodeError):
-                                                                                            
+
                 continue
     return list(profiles.values())
 
@@ -380,12 +383,11 @@ def update_face_profile_info(engine, profile_id, new_name="", description_additi
 
 def delete_face_profile(engine, profile_id):
     with engine.begin() as connection:
-                                                                                     
+
         connection.execute(text("UPDATE analysis_history SET profile_id = NULL WHERE profile_id = :id"), {"id": int(profile_id)})
         connection.execute(text("DELETE FROM face_profiles WHERE id = :id"), {"id": int(profile_id)})
 
 def find_face_profile_matches(embedding, profiles):
-    """Vectorized profile matching while preserving the existing score formula."""
     query = normalize_embedding(embedding)
     matches = []
     for profile in profiles:
@@ -437,7 +439,7 @@ def map_identity_face_to_measurement_face(identity_face, measurement_faces, imag
         distance = float(np.hypot(target_x - center_x, target_y - center_y))
         if distance < best_distance:
             best_index, best_distance = i, distance
-                                                                                        
+
     return best_index if best_index is not None and best_distance <= 0.18 else None
 
 def get_match_threshold():
@@ -650,7 +652,6 @@ def draw_measurement_overlay(image, face):
     return np.asarray(canvas)
 
 def draw_astar_path(image, landmarks, path):
-    """Render a computed A* landmark route without modifying the source image."""
     from PIL import ImageDraw
 
     canvas = Image.fromarray(validate_image(image).copy())
@@ -675,16 +676,7 @@ def draw_astar_path(image, landmarks, path):
         draw.ellipse((point[0] - radius, point[1] - radius, point[0] + radius, point[1] + radius), fill=fill)
     return np.asarray(canvas)
 
-
-def pct(value):
-    return f"{value * 100:.2f}%" if value is not None else "N/A"
-
-def generate_ai_measurement_explanation(measurements, image_width, image_height, profile_context=None):
-    """Format saved profile fields locally without making a Gemini API request.
-
-    This section only presents metadata already stored in the database, so an LLM
-    call adds latency and can fail during provider overload without adding value.
-    """
+def generate_ai_measurement_explanation(profile_context=None):
     profile_context = profile_context or {}
     if profile_context.get("no_match") or profile_context.get("status") == "no saved profile match":
         return "No profile matching this person was found. If you would like, please create a new profile."
@@ -720,6 +712,78 @@ def generate_ai_measurement_explanation(measurements, image_width, image_height,
     }
     return "\n\n".join(f"**{field}:** {value}" for field, value in fields.items())
 
+
+def _landmark_vector(point):
+    values = [float(point.get(axis, 0.0)) for axis in ("x", "y", "z")]
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("Landmark coordinates must be finite numbers.")
+    return np.asarray(values, dtype=np.float64)
+
+def astar_landmark_path(landmarks, start, goal, k_neighbors=6):
+    count = len(landmarks)
+    if count < 2:
+        raise ValueError("At least two landmarks are required.")
+    if not 0 <= int(start) < count or not 0 <= int(goal) < count:
+        raise IndexError("Start and goal must refer to existing landmarks.")
+    if int(start) == int(goal):
+        return {"path": [int(start)], "cost": 0.0, "expanded_nodes": 0}
+
+    vectors = np.vstack([_landmark_vector(point) for point in landmarks])
+    differences = vectors[:, None, :] - vectors[None, :, :]
+    distances = np.linalg.norm(differences, axis=2)
+    neighbors = max(1, min(int(k_neighbors), count - 1))
+
+    graph = [set() for _ in range(count)]
+    for node in range(count):
+        nearest = np.argpartition(distances[node], neighbors)[:neighbors + 1]
+        nearest = [int(other) for other in nearest if int(other) != node]
+        nearest.sort(key=lambda other: distances[node, other])
+        for other in nearest[:neighbors]:
+            graph[node].add(other)
+            graph[other].add(node)
+
+    start, goal = int(start), int(goal)
+    def heuristic(node):
+        return float(np.linalg.norm(vectors[node] - vectors[goal]))
+
+    counter = itertools.count()
+    frontier = [(heuristic(start), next(counter), start)]
+    came_from = {}
+    g_score = {start: 0.0}
+    closed = set()
+    expanded_nodes = 0
+
+    while frontier:
+        _, _, current = heapq.heappop(frontier)
+        if current in closed:
+            continue
+        if current == goal:
+            path = [goal]
+            while path[-1] != start:
+                path.append(came_from[path[-1]])
+            path.reverse()
+            return {
+                "path": path,
+                "cost": float(g_score[goal]),
+                "expanded_nodes": expanded_nodes,
+            }
+
+        closed.add(current)
+        expanded_nodes += 1
+        for neighbor in graph[current]:
+            tentative_g = g_score[current] + float(distances[current, neighbor])
+            if tentative_g < g_score.get(neighbor, float("inf")):
+                came_from[neighbor] = current
+                g_score[neighbor] = tentative_g
+                if neighbor in closed:
+                    closed.remove(neighbor)
+                heapq.heappush(
+                    frontier,
+                    (tentative_g + heuristic(neighbor), next(counter), neighbor),
+                )
+
+    raise ValueError("No path was found in the generated landmark graph.")
+
 render_header()
 source, show_landmarks, show_coordinates, show_measurements = render_sidebar()
 
@@ -745,7 +809,7 @@ except Exception as exc:
 if db_engine is None:
     st.caption("Database saving is unavailable until DATABASE_URL is configured correctly.")
     if db_error:
-                                                                                
+
         st.warning("Database connection failed. Check DATABASE_URL in Streamlit Secrets and review the private app logs for details.")
 
 if uploaded_file is not None:
@@ -912,9 +976,7 @@ if uploaded_file is not None:
                                     profile_context = {"no_match": True, "status": "no saved profile match"}
                         elif matched_identity is not None:
                             profile_context = {"no_match": True, "status": "low quality image; request clearer photo"}
-                    explanation = generate_ai_measurement_explanation(
-                        selected, original.shape[1], original.shape[0], profile_context
-                    )
+                    explanation = generate_ai_measurement_explanation(profile_context)
                 st.session_state["ai_measurement_explanation"] = explanation
                 st.session_state["ai_measurement_explanation_face"] = selected_index
             except Exception as exc:
@@ -963,7 +1025,7 @@ if uploaded_file is not None:
                     confirmed_face_index = st.session_state.get("confirmed_profile_face_index")
                     confirmed_identity_index = st.session_state.get("confirmed_profile_identity_index")
                     active_identity_index = st.session_state.get("identity_face_select")
-                                                                                        
+
                     if confirmed_identity_index != active_identity_index:
                         confirmed_profile_id = None
                         confirmed_face_index = None
