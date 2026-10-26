@@ -650,31 +650,6 @@ def draw_measurement_overlay(image, face):
 
     return np.asarray(canvas)
 
-def draw_astar_path(image, landmarks, path):
-    from PIL import ImageDraw
-
-    canvas = Image.fromarray(validate_image(image).copy())
-    draw = ImageDraw.Draw(canvas)
-    width, height = canvas.size
-    coords = []
-    for index in path:
-        point = landmarks[index]
-        x = int(round(float(point["x"]) * width))
-        y = int(round(float(point["y"]) * height))
-        coords.append((max(0, min(width - 1, x)), max(0, min(height - 1, y))))
-    if len(coords) >= 2:
-        draw.line(coords, fill=(255, 80, 40), width=max(2, width // 400), joint="curve")
-    radius = max(4, width // 180)
-    for position, point in enumerate(coords):
-        if position == 0:
-            fill = (40, 220, 100)
-        elif position == len(coords) - 1:
-            fill = (255, 210, 40)
-        else:
-            fill = (255, 80, 40)
-        draw.ellipse((point[0] - radius, point[1] - radius, point[0] + radius, point[1] + radius), fill=fill)
-    return np.asarray(canvas)
-
 def generate_ai_measurement_explanation(profile_context=None):
     profile_context = profile_context or {}
     if profile_context.get("no_match") or profile_context.get("status") == "no saved profile match":
@@ -856,59 +831,6 @@ if uploaded_file is not None:
         )
 
         selected = analyses[selected_index]
-
-        with st.expander("A* Search: Landmark Graph Path Explorer", expanded=False):
-            st.caption(
-                "A* searches a k-nearest-neighbor graph built from this face's landmarks. "
-                "Edge costs and the Euclidean heuristic use normalized 3D landmark coordinates. "
-                "This exploratory route does not change identity matching or saved data."
-            )
-            landmark_points = faces[selected_index].get("landmarks", [])
-            landmark_indices = list(range(len(landmark_points)))
-            if len(landmark_indices) >= 2:
-                default_start = 33 if 33 in landmark_indices else 0
-                default_end = 263 if 263 in landmark_indices else len(landmark_indices) - 1
-                path_col1, path_col2 = st.columns(2)
-                with path_col1:
-                    path_start = st.selectbox(
-                        "Start landmark", landmark_indices,
-                        index=default_start,
-                        key=f"astar_start_{selected_index}_{current_image_fingerprint[:8]}",
-                    )
-                with path_col2:
-                    path_goal = st.selectbox(
-                        "Goal landmark", landmark_indices,
-                        index=default_end,
-                        key=f"astar_goal_{selected_index}_{current_image_fingerprint[:8]}",
-                    )
-                path_neighbors = st.slider(
-                    "Graph neighbors per landmark", min_value=3, max_value=12, value=6,
-                    help="Higher values create more connections and may shorten paths, but increase graph density.",
-                    key=f"astar_neighbors_{selected_index}_{current_image_fingerprint[:8]}",
-                )
-                if st.button("Run A* Search", key=f"run_astar_{selected_index}_{current_image_fingerprint[:8]}"):
-                    if path_start == path_goal:
-                        st.info("Choose two different landmark indices to search for a path.")
-                    else:
-                        try:
-                            path_result = astar_landmark_path(
-                                landmark_points, path_start, path_goal, k_neighbors=path_neighbors
-                            )
-                            path_overlay = draw_astar_path(original, landmark_points, path_result["path"])
-                            st.success(
-                                f"A* found a path with {len(path_result['path'])} landmarks, "
-                                f"cost {path_result['cost']:.5f}, and "
-                                f"{path_result['expanded_nodes']} expanded nodes."
-                            )
-                            show_image(path_overlay, "A* landmark path")
-                            st.caption(
-                                "This is the shortest path on the generated k-nearest-neighbor graph, "
-                                "not a medical or identity measurement."
-                            )
-                        except (ValueError, IndexError, KeyError) as exc:
-                            st.warning(f"A* path search could not complete: {exc}")
-            else:
-                st.info("At least two detected landmarks are required for A* path search.")
 
         st.subheader("AI Measurement Explanation")
         st.caption(
