@@ -6,7 +6,6 @@ import numpy as np
 import streamlit as st
 from PIL import Image
 
-
 def configure_page():
     st.set_page_config(
         page_title="AI Vision Lab",
@@ -87,7 +86,6 @@ def configure_page():
         unsafe_allow_html=True,
     )
 
-
 def render_header():
     st.markdown(
         """
@@ -104,7 +102,6 @@ def render_header():
         """,
         unsafe_allow_html=True,
     )
-
 
 def render_sidebar():
     with st.sidebar:
@@ -133,7 +130,6 @@ def render_sidebar():
         )
     return source, show_landmarks, show_coordinates, show_measurements
 
-
 def show_image(image, caption):
     image = np.asarray(image)
     if image.ndim != 3 or image.shape[2] != 3:
@@ -155,11 +151,3 @@ def show_image(image, caption):
         </div>
         """
     )
-
-
-def section_heading(title, description=None):
-    safe_title = html.escape(str(title))
-    st.markdown(f'<div class="vision-section-label">{safe_title}</div>', unsafe_allow_html=True)
-    if description:
-        safe_description = html.escape(str(description))
-        st.markdown(f'<div class="vision-section-description">{safe_description}</div>', unsafe_allow_html=True)
