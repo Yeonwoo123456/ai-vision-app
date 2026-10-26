@@ -1,4 +1,3 @@
-
 from pathlib import Path
 import urllib.request
 
@@ -7,7 +6,6 @@ import numpy as np
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
-
 
 MODEL_PATH = Path(__file__).parent / "face_landmarker.task"
 
@@ -18,7 +16,6 @@ MODEL_URL = (
     "face_landmarker.task"
 )
 
-
 NOSE_CONNECTIONS = [
     (168, 6), (6, 197), (197, 195), (195, 5),
     (5, 4), (4, 1), (1, 19), (19, 94),
@@ -28,11 +25,9 @@ NOSE_CONNECTIONS = [
     (358, 327), (327, 294), (294, 278),
 ]
 
-
 def ensure_model():
     if not MODEL_PATH.exists() or MODEL_PATH.stat().st_size == 0:
         urllib.request.urlretrieve(MODEL_URL, str(MODEL_PATH))
-
 
 def draw_connections(image, landmarks, connections, color, thickness=1):
     height, width = image.shape[:2]
@@ -55,7 +50,6 @@ def draw_connections(image, landmarks, connections, color, thickness=1):
 
         cv2.line(image, p1, p2, color, thickness, cv2.LINE_AA)
 
-
 def draw_nose(image, landmarks, color=(255, 0, 255), thickness=2):
     height, width = image.shape[:2]
 
@@ -73,72 +67,6 @@ def draw_nose(image, landmarks, color=(255, 0, 255), thickness=2):
         )
 
         cv2.line(image, p1, p2, color, thickness, cv2.LINE_AA)
-
-
-def draw_point(image, landmark, color, radius=3):
-    height, width = image.shape[:2]
-
-    point = (
-        int(landmark.x * width),
-        int(landmark.y * height),
-    )
-
-    cv2.circle(image, point, radius, color, -1, cv2.LINE_AA)
-
-
-def draw_measurement(image, landmarks):
-    height, width = image.shape[:2]
-
-    if len(landmarks) <= 454:
-        return
-
-    left_eye_ids = [33, 133, 159, 145]
-    right_eye_ids = [362, 263, 386, 374]
-
-    def center(indices):
-        points = np.array([
-            [landmarks[i].x * width, landmarks[i].y * height]
-            for i in indices
-        ])
-
-        return tuple(np.round(points.mean(axis=0)).astype(int))
-
-    left_eye = center(left_eye_ids)
-    right_eye = center(right_eye_ids)
-    face_left = (
-        int(landmarks[234].x * width),
-        int(landmarks[234].y * height),
-    )
-    face_right = (
-        int(landmarks[454].x * width),
-        int(landmarks[454].y * height),
-    )
-    face_top = (
-        int(landmarks[10].x * width),
-        int(landmarks[10].y * height),
-    )
-    face_bottom = (
-        int(landmarks[152].x * width),
-        int(landmarks[152].y * height),
-    )
-
-    cv2.line(image, left_eye, right_eye, (0, 255, 255), 2, cv2.LINE_AA)
-    cv2.line(image, face_left, face_right, (255, 255, 0), 2, cv2.LINE_AA)
-
-    center_x = (face_top[0] + face_bottom[0]) // 2
-
-    cv2.line(
-        image,
-        (center_x, face_top[1]),
-        (center_x, face_bottom[1]),
-        (255, 255, 255),
-        1,
-        cv2.LINE_AA,
-    )
-
-    for point in (left_eye, right_eye):
-        cv2.circle(image, point, 5, (0, 255, 255), -1, cv2.LINE_AA)
-
 
 def detect_faces(image_rgb):
     if image_rgb is None or image_rgb.size == 0:
@@ -222,7 +150,6 @@ def detect_faces(image_rgb):
             )
 
         draw_nose(annotated_rgb, landmarks)
-        draw_measurement(annotated_rgb, landmarks)
 
         points = []
 
