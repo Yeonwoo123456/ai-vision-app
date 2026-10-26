@@ -1,4 +1,3 @@
-app.py
 import hashlib
 import heapq
 import io
